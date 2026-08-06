@@ -1,0 +1,6 @@
+#!/bin/sh
+# hub-service-zig test runner. channel-zig needs zig 0.15.x: the homebrew
+# keg (zig@0.15) is the only toolchain that links on this machine (macOS 27
+# Xcode-beta SDK); PATH zig 0.16 breaks the websocket.zig dep.
+export PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH
+exec zig build test "$@"

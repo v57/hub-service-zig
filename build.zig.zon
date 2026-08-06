@@ -1,0 +1,12 @@
+.{
+    .name = .hub_service_zig,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{
+        .channel_zig = .{
+            .path = "../channel-zig",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0x9cf12fd950c9561c,
+}
