@@ -4,7 +4,7 @@
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .channel_zig = .{
-            .path = "../channel-zig",
+            .path = "../../Channel/channel-zig",
         },
     },
     .paths = .{""},
