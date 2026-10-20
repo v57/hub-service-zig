@@ -194,6 +194,50 @@ test "device: instance defaults" {
     try testing.expectEqualStrings("ab", hub_service.device.truncate("ab\xc3\xa9", 3));
 }
 
+test "vectors: caller" {
+    var vectors = try loadVectors();
+    defer vectors.deinit();
+    const root = vectors.value;
+    const caller = hub_service.Caller.fromContext(vector(root, &.{ "caller", "context" })).?;
+    try testing.expectEqualStrings(vectorText(root, &.{ "keys", "service", "publicKey" }), caller.key.?);
+    try testing.expectEqualStrings(vectorText(root, &.{ "keys", "device", "deviceId" }), caller.device.?.id);
+    try testing.expectEqualStrings("Mac Studio", caller.device.?.name);
+    try testing.expectEqual(@as(usize, 1), caller.groups.len);
+    try testing.expect(caller.inGroup("owners"));
+    try testing.expect(caller.owner);
+    try testing.expect(caller.via == null and caller.claimed == null);
+    try testing.expectEqualStrings(vectorText(root, &.{ "keys", "hub", "publicKey" }), caller.hub_key.?);
+}
+
+fn parseContext(text: []const u8) !std.json.Parsed(Value) {
+    return std.json.parseFromSlice(Value, testing.allocator, text, .{ .allocate = .alloc_always });
+}
+
+test "caller: absent, anonymous and through a merged hub" {
+    {
+        var context = try parseContext("{\"service\":\"abc\"}");
+        defer context.deinit();
+        try testing.expect(hub_service.Caller.fromContext(context.value) == null);
+    }
+    try testing.expect(hub_service.Caller.fromContext(.null) == null);
+    {
+        var context = try parseContext("{\"hub\":{\"caller\":{\"groups\":[],\"owner\":false},\"hubKey\":\"H\"}}");
+        defer context.deinit();
+        const caller = hub_service.Caller.fromContext(context.value).?;
+        try testing.expect(caller.key == null and caller.device == null and !caller.owner);
+        try testing.expectEqualStrings("H", caller.hub_key.?);
+    }
+    {
+        var context = try parseContext("{\"hub\":{\"caller\":{\"key\":\"M\",\"groups\":[\"g1\",\"g2\"],\"owner\":false,\"via\":\"V\",\"claimed\":{\"key\":\"K\",\"owner\":true}},\"hubKey\":\"H\"}}");
+        defer context.deinit();
+        const caller = hub_service.Caller.fromContext(context.value).?;
+        try testing.expectEqualStrings("M", caller.key.?);
+        try testing.expect(caller.inGroup("g2") and !caller.inGroup("owners"));
+        try testing.expectEqualStrings("V", caller.via.?);
+        try testing.expectEqualStrings("K", caller.claimed.?.object.get("key").?.string);
+    }
+}
+
 test "keychain: hub key pins live beside the key file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -471,4 +515,58 @@ test "fake hub: disabled device mode sends no certificate" {
     try testing.expectEqual(@as(usize, 1), connect_count.load(.acquire));
     try testing.expectEqual(@as(usize, 0), connects[0].device_len);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access("device.key", .{}));
+}
+
+fn whoHandler(request: hub_service.PostRequest(?*Service, Value, Value)) !?Value {
+    const caller = hub_service.Caller.fromContext(request.context) orelse return .null;
+    return .{ .string = if (caller.owner) caller.device.?.name else caller.key orelse "-" };
+}
+
+fn whoStream(_: Value, emit: hub_service.Emit) !void {
+    const caller = emit.caller() orelse return emit.emit(.null);
+    try emit.emit(.{ .string = caller.key orelse "-" });
+}
+
+test "fake hub: handlers see the caller" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var hub: FakeHub = undefined;
+    try hub.start(false);
+    defer hub.deinit();
+
+    var svc = try fixture.service(&hub);
+    defer svc.deinit();
+    _ = try svc.post("who", whoHandler, null);
+    _ = try svc.stream("who/stream", whoStream, null);
+    _ = try svc.start();
+    hub.wait(1, 5000);
+
+    var sender = hub_sender.?;
+    const Context = struct { hub: struct {
+        caller: struct { key: []const u8, device: struct { id: []const u8, name: []const u8 }, groups: []const []const u8, owner: bool },
+        hubKey: []const u8,
+    } };
+    const context = Context{ .hub = .{
+        .caller = .{ .key = "K", .device = .{ .id = "d", .name = "Mac Studio" }, .groups = &.{"owners"}, .owner = true },
+        .hubKey = HUB_KEY,
+    } };
+    {
+        var reply = try sender.sendWithContext(testing.allocator, []const u8, "who", 7, context);
+        defer reply.deinit(testing.allocator);
+        try testing.expectEqualStrings("Mac Studio", reply.ok.?);
+    }
+    {
+        // A call without hub context has no caller (and still succeeds).
+        var reply = try sender.send(testing.allocator, ?[]const u8, "who", 7);
+        defer reply.deinit(testing.allocator);
+        try testing.expect(reply == .ok and reply.ok.? == null);
+    }
+    {
+        var values = try sender.values(testing.allocator, i64, []const u8, Context, "who/stream", 7, context);
+        defer values.close();
+        var next = try values.next(testing.allocator);
+        defer next.deinit(testing.allocator);
+        try testing.expectEqualStrings("K", next.item);
+    }
+    svc.stop();
 }

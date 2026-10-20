@@ -42,6 +42,81 @@ pub const CallResult = channel.CallResult;
 pub const StreamNext = channel.StreamNext;
 pub const Sender = channel.Sender;
 
+/// The caller's device, when its connection is device-attached.
+pub const CallerDevice = struct {
+    id: []const u8,
+    name: []const u8 = "",
+};
+
+/// Who is calling (Docs/Devices/protocol.md section 4), from
+/// `context.hub.caller`. The hub replaces any client-supplied `context.hub`,
+/// so handlers can trust it. Borrowed from the request context: valid while
+/// the handler runs.
+///
+/// Read it in a post handler declared with a `std.json.Value` context:
+/// `fn (request: PostRequest(?*Service, Value, Value)) !?Value` and
+/// `Caller.fromContext(request.context)`; stream handlers use `emit.caller()`.
+pub const Caller = struct {
+    /// Caller SPKI; null for anonymous callers.
+    key: ?[]const u8 = null,
+    /// Null unless the caller's connection is device-attached.
+    device: ?CallerDevice = null,
+    /// Groups of the key or its device (strings).
+    groups: []const Value = &.{},
+    /// Member of the owners group.
+    owner: bool = false,
+    /// Merged hub SPKI when the call came through a merged hub.
+    via: ?[]const u8 = null,
+    /// The merged hub's own caller (unverified).
+    claimed: ?Value = null,
+    /// The forwarding hub's key (`context.hub.hubKey`).
+    hub_key: ?[]const u8 = null,
+
+    /// The caller in a request context; null when it has no hub caller
+    /// (hub-lite, or a call that didn't come through a hub).
+    pub fn fromContext(context: Value) ?Caller {
+        const hub = objectField(context, "hub") orelse return null;
+        const caller = objectField(hub, "caller") orelse return null;
+        if (caller != .object) return null;
+        var result = Caller{
+            .key = stringField(caller, "key"),
+            .owner = if (objectField(caller, "owner")) |owner| owner == .bool and owner.bool else false,
+            .via = stringField(caller, "via"),
+            .hub_key = stringField(hub, "hubKey"),
+        };
+        if (objectField(caller, "device")) |device_value| {
+            if (stringField(device_value, "id")) |id| {
+                result.device = .{ .id = id, .name = stringField(device_value, "name") orelse "" };
+            }
+        }
+        if (objectField(caller, "groups")) |groups| {
+            if (groups == .array) result.groups = groups.array.items;
+        }
+        if (objectField(caller, "claimed")) |claimed| {
+            if (claimed != .null) result.claimed = claimed;
+        }
+        return result;
+    }
+
+    /// Whether the caller is in the group with this id.
+    pub fn inGroup(self: Caller, id: []const u8) bool {
+        for (self.groups) |group| {
+            if (group == .string and std.mem.eql(u8, group.string, id)) return true;
+        }
+        return false;
+    }
+
+    fn objectField(value: Value, name: []const u8) ?Value {
+        if (value != .object) return null;
+        return value.object.get(name);
+    }
+
+    fn stringField(value: Value, name: []const u8) ?[]const u8 {
+        const field = objectField(value, name) orelse return null;
+        return if (field == .string) field.string else null;
+    }
+};
+
 /// Handler state: every registered handler reaches the owning Service via
 /// `request.state.*`.
 pub const State = ?*Service;
@@ -255,12 +330,12 @@ pub const Service = struct {
     pub fn stream(self: *Service, path: []const u8, comptime handler: anytype, settings: ?ApiSettings) !*Service {
         try self.addPath(path, settings);
         const Wrapper = struct {
-            fn invoke(request: channel.StreamRequest(?*Service, std.json.Value, void, std.json.Value)) !void {
+            fn invoke(request: channel.StreamRequest(?*Service, std.json.Value, std.json.Value, std.json.Value)) !void {
                 const emit = Emit{ .request = &request };
                 try handler(request.body, emit);
             }
         };
-        _ = try self.ch.stream(std.json.Value, std.json.Value, void, path, Wrapper.invoke);
+        _ = try self.ch.stream(std.json.Value, std.json.Value, std.json.Value, path, Wrapper.invoke);
         return self;
     }
 
@@ -633,7 +708,17 @@ pub const Service = struct {
 
 /// Emit handle passed to stream handlers; wraps the channel stream emitter.
 pub const Emit = struct {
-    request: *const channel.StreamRequest(?*Service, std.json.Value, void, std.json.Value),
+    request: *const channel.StreamRequest(?*Service, std.json.Value, std.json.Value, std.json.Value),
+
+    /// Who is calling; null when the call carries no hub caller.
+    pub fn caller(self: *const Emit) ?Caller {
+        return Caller.fromContext(self.request.context);
+    }
+
+    /// The whole request context (`service`/`device` selection, `hub`).
+    pub fn context(self: *const Emit) std.json.Value {
+        return self.request.context;
+    }
 
     pub fn emit(self: *const Emit, value: std.json.Value) !void {
         const svc = self.request.state.*.?;
