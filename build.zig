@@ -32,6 +32,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hub_service", .module = hub_service_module },
         },
     });
+    // Device layer test vectors, shared by every SDK (Hub/Docs/Devices).
+    const test_options = b.addOptions();
+    test_options.addOption([]const u8, "vectors_path", b.pathFromRoot("../../Docs/Devices/vectors.json"));
+    unit_test_module.addOptions("test_options", test_options);
+
     const unit_tests = b.addTest(.{
         .name = "test-unit",
         .root_module = unit_test_module,

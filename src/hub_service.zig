@@ -4,7 +4,9 @@
 //! register apps, and call API through the hub. On every (re)connect the
 //! service attaches a fresh hub-pro auth token (`auth` header) signed by the
 //! keychain `auth` file (TS parity with hub-service/keychain.ts) — hub-lite
-//! ignores these headers. The wire contract matches the TS reference
+//! ignores these headers. With no hub key pinned for the address it connects
+//! with v0, asks hub/info for the hub key, pins it in hubs.json and
+//! reconnects with a v1 token bound to that hub (Docs/Devices/protocol.md). The wire contract matches the TS reference
 //! (`hub/profile/update`, `hub/service/update`, AppInterface + element DSL).
 //!
 //! Depends on channel-zig (`channel` module). Use zig 0.15.x — on macOS 27
@@ -14,12 +16,14 @@
 //! Xcode-beta SDK).
 
 const std = @import("std");
-const channel = @import("channel");
+pub const channel = @import("channel");
 const keychain_mod = @import("keychain.zig");
 
 pub const Keychain = keychain_mod.Keychain;
 pub const PRIVATE_DER_LENGTH = keychain_mod.PRIVATE_DER_LENGTH;
 pub const PUBLIC_DER_LENGTH = keychain_mod.PUBLIC_DER_LENGTH;
+pub const AUTH_EXPIRY = keychain_mod.AUTH_EXPIRY;
+pub const authToken = keychain_mod.authToken;
 
 pub const Allocator = std.mem.Allocator;
 pub const Value = std.json.Value;
@@ -113,6 +117,8 @@ pub const Service = struct {
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
     mutex: std.Thread.Mutex = .{},
+    /// The current connection used a pinned hub key (v1).
+    hub_key_known: bool = false,
 
     /// Creates a Service. Address defaults to 1997, or $HUB when set.
     pub fn init(allocator: Allocator, options: ServiceOptions) !Service {
@@ -280,6 +286,26 @@ pub const Service = struct {
         return self;
     }
 
+    /// The address as a URL: a port becomes `ws://127.0.0.1:<port>`. Hub key
+    /// pins are stored under it. Owned; free it.
+    pub fn addressUrl(self: *Service, allocator: Allocator) ![]u8 {
+        return switch (self.address) {
+            .port => |port| std.fmt.allocPrint(allocator, "ws://127.0.0.1:{d}", .{port}),
+            .url => |url| allocator.dupe(u8, url),
+        };
+    }
+
+    /// Forgets the hub key pinned for this service's address. Use it when a
+    /// v1 connect keeps failing with `invalid signature` because the hub's
+    /// key changed on purpose; the next connect learns it again.
+    pub fn forgetHubKey(self: *Service) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const address = try self.addressUrl(self.allocator);
+        defer self.allocator.free(address);
+        try self.keychain.forgetHubKey(address);
+    }
+
     /// Requests the poll loop to stop (used by deinit).
     pub fn stop(self: *Service) void {
         self.stop_flag.store(true, .release);
@@ -404,13 +430,37 @@ pub const Service = struct {
     }
 
     /// A fresh raw header block for the HTTP upgrade request: the auth token
-    /// (built per connect — the token embeds an expiry) plus the protocol
-    /// version. The channel client memcpys this verbatim after the standard
-    /// headers. hub-lite ignores these headers. Owned; free it.
-    fn authHeaderBlock(self: *Service) ![]u8 {
-        const token = try self.keychain.sign(10);
+    /// (built per connect — the token embeds an expiry; v1 when a hub key is
+    /// pinned for the address, else v0) plus the protocol version. The
+    /// channel client memcpys this verbatim after the standard headers.
+    /// hub-lite ignores these headers. Owned; free it.
+    pub fn connectHeaderBlock(self: *Service) ![]u8 {
+        const address = try self.addressUrl(self.allocator);
+        defer self.allocator.free(address);
+        const hub_key = try self.keychain.hubKey(address);
+        defer if (hub_key) |key| self.allocator.free(key);
+        self.hub_key_known = hub_key != null;
+        const token = try self.keychain.signForHub(hub_key, AUTH_EXPIRY);
         defer self.allocator.free(token);
-        return std.fmt.allocPrint(self.allocator, "auth: {s}\r\nv: 0\r\n", .{token});
+        return std.fmt.allocPrint(self.allocator, "auth: {s}\r\nv: {s}\r\n", .{ token, if (hub_key != null) "1" else "0" });
+    }
+
+    /// Asks hub/info for the hub key and pins it. True when a key was pinned
+    /// (the caller reconnects with v1); hub-lite answers with an error.
+    fn learnHubKey(self: *Service, client: *channel.Client(?*Service)) bool {
+        var result = client.send(self.allocator, std.json.Value, "hub/info", {}) catch return false;
+        defer result.deinit(self.allocator);
+        const info = switch (result) {
+            .ok => |value| value orelse return false,
+            .remote_err => return false,
+        };
+        if (info != .object) return false;
+        const key = info.object.get("key") orelse return false;
+        if (key != .string or key.string.len == 0) return false;
+        const address = self.addressUrl(self.allocator) catch return false;
+        defer self.allocator.free(address);
+        self.keychain.pinHubKey(address, key.string) catch return false;
+        return true;
     }
 
     fn pollLoop(self: *Service) void {
@@ -425,7 +475,7 @@ pub const Service = struct {
                     }
                 }
                 if (self.client == null) {
-                    const headers = self.authHeaderBlock() catch |err| {
+                    const headers = self.connectHeaderBlock() catch |err| {
                         std.debug.print("hub-service: auth token failed ({s}); retrying in 1s\n", .{@errorName(err)});
                         self.mutex.unlock();
                         std.Thread.sleep(1 * std.time.ns_per_s);
@@ -460,6 +510,14 @@ pub const Service = struct {
                         std.debug.print("hub-service: update send failed ({s})\n", .{@errorName(err)});
                     };
                     was_connected = true;
+                    if (!self.hub_key_known and self.learnHubKey(client)) {
+                        // Reconnect at once with the hub-bound v1 token.
+                        client.deinit();
+                        self.client = null;
+                        was_connected = false;
+                        self.mutex.unlock();
+                        continue;
+                    }
                 }
                 if (!connected) was_connected = false;
             }

@@ -5,6 +5,10 @@ const std = @import("std");
 const hub_service = @import("hub_service");
 
 const testing = std.testing;
+
+test {
+    _ = @import("devices_test.zig");
+}
 const Service = hub_service.Service;
 const Value = std.json.Value;
 
