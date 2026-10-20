@@ -6,7 +6,10 @@
 //! keychain `auth` file (TS parity with hub-service/keychain.ts) — hub-lite
 //! ignores these headers. With no hub key pinned for the address it connects
 //! with v0, asks hub/info for the hub key, pins it in hubs.json and
-//! reconnects with a v1 token bound to that hub (Docs/Devices/protocol.md). The wire contract matches the TS reference
+//! reconnects with a v1 token bound to that hub (Docs/Devices/protocol.md).
+//! Unless disabled, every connect also sends a certificate for the service
+//! key signed by the device key (see device.zig), renewed when less than a
+//! day is left. The wire contract matches the TS reference
 //! (`hub/profile/update`, `hub/service/update`, AppInterface + element DSL).
 //!
 //! Depends on channel-zig (`channel` module). Use zig 0.15.x — on macOS 27
@@ -18,6 +21,7 @@
 const std = @import("std");
 pub const channel = @import("channel");
 const keychain_mod = @import("keychain.zig");
+pub const device = @import("device.zig");
 
 pub const Keychain = keychain_mod.Keychain;
 pub const PRIVATE_DER_LENGTH = keychain_mod.PRIVATE_DER_LENGTH;
@@ -54,6 +58,19 @@ pub const ServiceOptions = struct {
     icon: ?Value = null,
     /// Keychain auth file path (default: $HUBKEY, else "auth" in the cwd).
     key_path: ?[]const u8 = null,
+    /// Instance name in the device certificate, unique per device
+    /// ("s3-local/Backup Disk"). Default: name, else the first segment of
+    /// the first registered path, else "service". Must outlive the Service.
+    instance: ?[]const u8 = null,
+    /// Suggested device name in the certificate. Default: the host name.
+    device_name: ?[]const u8 = null,
+    /// Declared parent device name, for containers and VMs.
+    parent: ?[]const u8 = null,
+    /// Device key path (default: $HUB_DEVICE_KEY, /var/lib/hub/device.key
+    /// for root, else ~/.hub/device.key).
+    device_key_path: ?[]const u8 = null,
+    /// No device key and no `device` header: a plain key connection.
+    disable_device: bool = false,
 };
 
 /// Sent to the hub as hub/profile/update on every (re)connect.
@@ -119,6 +136,16 @@ pub const Service = struct {
     mutex: std.Thread.Mutex = .{},
     /// The current connection used a pinned hub key (v1).
     hub_key_known: bool = false,
+    /// Null when device mode is off or there is no home directory.
+    device_key: ?device.DeviceKey = null,
+    instance_option: ?[]const u8 = null,
+    device_name: ?[]const u8 = null,
+    parent: ?[]const u8 = null,
+    /// The first registered path (owned by `paths`).
+    first_path: ?[]const u8 = null,
+    /// The current `device` header (owned) and its expiry.
+    certificate: ?[]u8 = null,
+    certificate_exp: i64 = 0,
 
     /// Creates a Service. Address defaults to 1997, or $HUB when set.
     pub fn init(allocator: Allocator, options: ServiceOptions) !Service {
@@ -153,8 +180,19 @@ pub const Service = struct {
             profile = .{ .name = options.name, .icon = options.icon };
         }
 
-        const keychain = try Keychain.init(allocator, key_path);
+        var keychain = try Keychain.init(allocator, key_path);
         errdefer keychain.deinit();
+
+        var device_key: ?device.DeviceKey = null;
+        if (!options.disable_device) {
+            if (options.device_key_path) |path| {
+                device_key = try device.DeviceKey.init(allocator, path);
+            } else if (try device.defaultPath(allocator)) |path| {
+                defer allocator.free(path);
+                device_key = try device.DeviceKey.init(allocator, path);
+            }
+        }
+        errdefer if (device_key) |*key| key.deinit();
 
         return .{
             .allocator = allocator,
@@ -164,6 +202,10 @@ pub const Service = struct {
             .owned_env = owned_env,
             .owned_key_env = owned_key_env,
             .keychain = keychain,
+            .device_key = device_key,
+            .instance_option = options.instance,
+            .device_name = options.device_name,
+            .parent = options.parent,
         };
     }
 
@@ -174,6 +216,8 @@ pub const Service = struct {
         if (self.owned_env) |env| self.allocator.free(env);
         if (self.owned_key_env) |env| self.allocator.free(env);
         self.keychain.deinit();
+        if (self.device_key) |*key| key.deinit();
+        if (self.certificate) |certificate| self.allocator.free(certificate);
 
         self.apps.deinit(self.allocator);
 
@@ -295,6 +339,56 @@ pub const Service = struct {
         };
     }
 
+    /// The instance name in the device certificate: the `instance` option,
+    /// else the profile name, else the first segment of the first registered
+    /// path, else "service". Borrowed from the Service.
+    pub fn instance(self: *const Service) []const u8 {
+        if (self.instance_option) |value| {
+            if (value.len > 0) return value;
+        }
+        if (self.profile) |profile| {
+            if (profile.name) |name| {
+                if (name.len > 0) return name;
+            }
+        }
+        if (self.first_path) |path| {
+            const segment = path[0 .. std.mem.indexOfScalar(u8, path, '/') orelse path.len];
+            if (segment.len > 0) return segment;
+        }
+        return "service";
+    }
+
+    /// The `device` header for a connect at `now`: the current certificate,
+    /// or a new one when there is none or less than CERTIFICATE_RENEW is
+    /// left. Null when device mode is off. Borrowed from the Service.
+    pub fn currentCertificate(self: *Service, now: i64) !?[]const u8 {
+        var device_key = &(self.device_key orelse return null);
+        if (self.certificate) |certificate| {
+            if (self.certificate_exp - now >= device.CERTIFICATE_RENEW) return certificate;
+        }
+        const service_key = try self.keychain.publicKey();
+        defer self.allocator.free(service_key);
+        const device_spki = try device_key.publicKey();
+        defer self.allocator.free(device_spki);
+        var host: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const device_name = self.device_name orelse device.hostName(&host);
+        const parent: ?[]const u8 = if (self.parent) |parent| (if (parent.len > 0) device.truncate(parent, 64) else null) else null;
+        const header = try device_key.sign(.{
+            .device = device_spki,
+            .service = service_key,
+            .instance = device.truncate(self.instance(), 128),
+            .deviceName = if (device_name) |name| device.truncate(name, 64) else null,
+            .platform = device.platform(),
+            .parent = parent,
+            .iat = now,
+            .exp = now + device.CERTIFICATE_LIFETIME,
+        });
+        if (self.certificate) |old| self.allocator.free(old);
+        self.certificate = header;
+        self.certificate_exp = now + device.CERTIFICATE_LIFETIME;
+        return header;
+    }
+
     /// Forgets the hub key pinned for this service's address. Use it when a
     /// v1 connect keeps failing with `invalid signature` because the hub's
     /// key changed on purpose; the next connect learns it again.
@@ -376,6 +470,7 @@ pub const Service = struct {
             } else {
                 gop.key_ptr.* = owned;
                 stored_path = owned;
+                if (self.first_path == null) self.first_path = owned;
             }
         }
         if (settings) |st| {
@@ -442,6 +537,15 @@ pub const Service = struct {
         self.hub_key_known = hub_key != null;
         const token = try self.keychain.signForHub(hub_key, AUTH_EXPIRY);
         defer self.allocator.free(token);
+        // A device key that can't be read or created leaves a plain key
+        // connection.
+        const certificate = self.currentCertificate(std.time.timestamp()) catch |err| blk: {
+            std.debug.print("hub-service: device certificate failed ({s})\n", .{@errorName(err)});
+            break :blk null;
+        };
+        if (certificate) |header| {
+            return std.fmt.allocPrint(self.allocator, "auth: {s}\r\nv: {s}\r\ndevice: {s}\r\n", .{ token, if (hub_key != null) "1" else "0", header });
+        }
         return std.fmt.allocPrint(self.allocator, "auth: {s}\r\nv: {s}\r\n", .{ token, if (hub_key != null) "1" else "0" });
     }
 

@@ -51,6 +51,149 @@ test "vectors: auth v0 and v1 tokens" {
     try testing.expectEqualStrings(vectorText(root, &.{ "auth", "v1", "header" }), v1);
 }
 
+fn checkCertificate(name: []const u8, instance: []const u8, device_name: []const u8, platform: []const u8, parent: ?[]const u8) !void {
+    var vectors = try loadVectors();
+    defer vectors.deinit();
+    const root = vectors.value;
+    const certificate = hub_service.device.Certificate{
+        .device = vectorText(root, &.{ "keys", "device", "publicKey" }),
+        .service = vectorText(root, &.{ "keys", "service", "publicKey" }),
+        .instance = instance,
+        .deviceName = device_name,
+        .platform = platform,
+        .parent = parent,
+        .iat = 1792500000,
+        .exp = 1793104800,
+    };
+    const text = try certificate.json(testing.allocator);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(vectorText(root, &.{ name, "json" }), text);
+    const header = try hub_service.device.encodeCertificate(testing.allocator, vectorText(root, &.{ "keys", "device", "keyFile" }), certificate);
+    defer testing.allocator.free(header);
+    try testing.expectEqualStrings(vectorText(root, &.{ name, "header" }), header);
+}
+
+test "vectors: certificate" {
+    try checkCertificate("certificate", "s3-local/Backup Disk", "Mac Studio", "macos", null);
+}
+
+test "vectors: child certificate" {
+    try checkCertificate("childCertificate", "builder", "builder", "linux", "Mac Studio");
+}
+
+test "vectors: device id and safety code" {
+    var vectors = try loadVectors();
+    defer vectors.deinit();
+    const root = vectors.value;
+    const key = vectorText(root, &.{ "keys", "device", "publicKey" });
+    try testing.expectEqualStrings(vectorText(root, &.{ "keys", "device", "deviceId" }), &(try hub_service.device.deviceId(key)));
+    try testing.expectEqualStrings(vectorText(root, &.{ "keys", "device", "safetyCode" }), &(try hub_service.device.safetyCode(key)));
+}
+
+/// The certificate JSON inside a `device` header.
+fn certificatePayload(header: []const u8) !std.json.Parsed(Value) {
+    const payload = header[0..std.mem.indexOfScalar(u8, header, '.').?];
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const text = try testing.allocator.alloc(u8, try decoder.calcSizeForSlice(payload));
+    defer testing.allocator.free(text);
+    try decoder.decode(text, payload);
+    return std.json.parseFromSlice(Value, testing.allocator, text, .{ .allocate = .alloc_always });
+}
+
+test "device: key file is created 0600 in a 0700 directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp, "hub/device.key");
+    defer testing.allocator.free(path);
+
+    var key = try hub_service.device.DeviceKey.init(testing.allocator, path);
+    defer key.deinit();
+    const first = try key.publicKey();
+    defer testing.allocator.free(first);
+    try testing.expectEqual(@as(std.fs.File.Mode, 0o600), (try tmp.dir.statFile("hub/device.key")).mode & 0o777);
+    var dir = try tmp.dir.openDir("hub", .{});
+    defer dir.close();
+    try testing.expectEqual(@as(std.fs.File.Mode, 0o700), (try dir.stat()).mode & 0o777);
+
+    var again = try hub_service.device.DeviceKey.init(testing.allocator, path);
+    defer again.deinit();
+    const second = try again.publicKey();
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings(first, second);
+}
+
+test "device: certificate renews with a day left" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var svc = try Service.init(testing.allocator, .{
+        .key_path = fixture.auth_path,
+        .device_key_path = fixture.device_path,
+        .instance = "s3-local/Backup Disk",
+        .device_name = "Mac Studio",
+        .parent = "Host",
+    });
+    defer svc.deinit();
+    const now: i64 = 1_792_500_000;
+
+    const first = try testing.allocator.dupe(u8, (try svc.currentCertificate(now)).?);
+    defer testing.allocator.free(first);
+    // 2 days left: kept.
+    try testing.expectEqualStrings(first, (try svc.currentCertificate(now + 5 * 86_400)).?);
+    // 12 hours left: renewed, issued at the new time.
+    const later = now + 6 * 86_400 + 43_200;
+    const renewed = (try svc.currentCertificate(later)).?;
+    try testing.expect(!std.mem.eql(u8, first, renewed));
+    var renewed_json = try certificatePayload(renewed);
+    defer renewed_json.deinit();
+    try testing.expectEqual(later, renewed_json.value.object.get("iat").?.integer);
+
+    var parsed = try certificatePayload(first);
+    defer parsed.deinit();
+    const fields = parsed.value.object;
+    const service_key = try svc.keychain.publicKey();
+    defer testing.allocator.free(service_key);
+    const device_key = try svc.device_key.?.publicKey();
+    defer testing.allocator.free(device_key);
+    try testing.expectEqual(@as(i64, 1), fields.get("v").?.integer);
+    try testing.expectEqualStrings(device_key, fields.get("device").?.string);
+    try testing.expectEqualStrings(service_key, fields.get("service").?.string);
+    try testing.expectEqualStrings("s3-local/Backup Disk", fields.get("instance").?.string);
+    try testing.expectEqualStrings("Mac Studio", fields.get("deviceName").?.string);
+    try testing.expectEqualStrings(hub_service.device.platform(), fields.get("platform").?.string);
+    try testing.expectEqualStrings("Host", fields.get("parent").?.string);
+    try testing.expectEqual(now + hub_service.device.CERTIFICATE_LIFETIME, fields.get("exp").?.integer);
+}
+
+fn noopHandler(request: hub_service.PostRequest(?*Service, Value, void)) !?Value {
+    return request.body;
+}
+
+test "device: instance defaults" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    {
+        var svc = try Service.init(testing.allocator, .{ .key_path = fixture.auth_path, .disable_device = true });
+        defer svc.deinit();
+        try testing.expectEqualStrings("service", svc.instance());
+        _ = try svc.post("s3/read", noopHandler, null);
+        _ = try svc.post("a/b", noopHandler, null);
+        try testing.expectEqualStrings("s3", svc.instance());
+    }
+    {
+        var svc = try Service.init(testing.allocator, .{ .key_path = fixture.auth_path, .disable_device = true, .name = "Backup Disk" });
+        defer svc.deinit();
+        _ = try svc.post("s3/read", noopHandler, null);
+        try testing.expectEqualStrings("Backup Disk", svc.instance());
+    }
+    {
+        var svc = try Service.init(testing.allocator, .{ .key_path = fixture.auth_path, .disable_device = true, .name = "Backup Disk", .instance = "s3-local/Backup Disk" });
+        defer svc.deinit();
+        try testing.expectEqualStrings("s3-local/Backup Disk", svc.instance());
+        try testing.expect((try svc.currentCertificate(0)) == null);
+    }
+    try testing.expectEqualStrings("ab", hub_service.device.truncate("ab\xc3\xa9", 3));
+}
+
 test "keychain: hub key pins live beside the key file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -208,6 +351,7 @@ const Fixture = struct {
         return Service.init(testing.allocator, .{
             .address = .{ .port = hub.server.port() },
             .key_path = self.auth_path,
+            .device_key_path = self.device_path,
         });
     }
 };
@@ -281,4 +425,50 @@ test "fake hub: hub-lite stays on v0" {
     try testing.expectEqual(@as(usize, 1), connect_count.load(.acquire));
     try testing.expectEqualStrings("0", Connect.get(&connects[0].v, connects[0].v_len));
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access("hubs.json", .{}));
+}
+
+test "fake hub: every connect carries the device certificate" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var hub: FakeHub = undefined;
+    try hub.start(true);
+    defer hub.deinit();
+
+    var svc = try fixture.service(&hub);
+    defer svc.deinit();
+    _ = try svc.start();
+    hub.wait(2, 5000);
+    svc.stop();
+
+    try testing.expectEqual(@as(usize, 2), connect_count.load(.acquire));
+    const first = Connect.get(&connects[0].device, connects[0].device_len);
+    // Same certificate on the reconnect (renewed only with a day left).
+    try testing.expectEqualStrings(first, Connect.get(&connects[1].device, connects[1].device_len));
+    var parsed = try certificatePayload(first);
+    defer parsed.deinit();
+    const service_key = try svc.keychain.publicKey();
+    defer testing.allocator.free(service_key);
+    try testing.expectEqualStrings(service_key, parsed.value.object.get("service").?.string);
+}
+
+test "fake hub: disabled device mode sends no certificate" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var hub: FakeHub = undefined;
+    try hub.start(false);
+    defer hub.deinit();
+
+    var svc = try Service.init(testing.allocator, .{
+        .address = .{ .port = hub.server.port() },
+        .key_path = fixture.auth_path,
+        .disable_device = true,
+    });
+    defer svc.deinit();
+    _ = try svc.start();
+    hub.wait(1, 5000);
+    svc.stop();
+
+    try testing.expectEqual(@as(usize, 1), connect_count.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), connects[0].device_len);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access("device.key", .{}));
 }
