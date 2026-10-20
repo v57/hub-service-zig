@@ -42,6 +42,23 @@ pub const CallResult = channel.CallResult;
 pub const StreamNext = channel.StreamNext;
 pub const Sender = channel.Sender;
 
+/// A hub address normalized for hub key pins (protocol.md section 2): a bare
+/// port "1997" becomes "ws://localhost:1997"; otherwise the URL as given with
+/// the scheme and host lowercased and no trailing slash. Owned; free it.
+pub fn normalizeHubAddress(allocator: Allocator, address: []const u8) ![]u8 {
+    var digits = address.len > 0;
+    for (address) |c| digits = digits and std.ascii.isDigit(c);
+    if (digits) return std.fmt.allocPrint(allocator, "ws://localhost:{s}", .{address});
+    const trimmed = std.mem.trimRight(u8, address, "/");
+    const out = try allocator.dupe(u8, trimmed);
+    if (std.mem.indexOf(u8, out, "://")) |scheme_end| {
+        const rest = out[scheme_end + 3 ..];
+        const authority_end = scheme_end + 3 + (std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len);
+        for (out[0..authority_end]) |*c| c.* = std.ascii.toLower(c.*);
+    }
+    return out;
+}
+
 /// The caller's device, when its connection is device-attached.
 pub const CallerDevice = struct {
     id: []const u8,
@@ -134,17 +151,24 @@ pub const ServiceOptions = struct {
     /// Keychain auth file path (default: $HUBKEY, else "auth" in the cwd).
     key_path: ?[]const u8 = null,
     /// Instance name in the device certificate, unique per device
-    /// ("s3-local/Backup Disk"). Default: name, else the first segment of
-    /// the first registered path, else "service". Must outlive the Service.
+    /// ("s3-local/Backup Disk"). Default: $HUB_INSTANCE, else name, else the
+    /// basename of the working directory, else "service". Must outlive the
+    /// Service.
     instance: ?[]const u8 = null,
-    /// Suggested device name in the certificate. Default: the host name.
+    /// Suggested device name in the certificate. Default: $HUB_DEVICE_NAME,
+    /// else the macOS computer name, else the host name.
     device_name: ?[]const u8 = null,
-    /// Declared parent device name, for containers and VMs.
+    /// Declared parent device name, for containers and VMs. Default:
+    /// $HUB_DEVICE_PARENT.
     parent: ?[]const u8 = null,
     /// Device key path (default: $HUB_DEVICE_KEY, /var/lib/hub/device.key
     /// for root, else ~/.hub/device.key).
     device_key_path: ?[]const u8 = null,
+    /// A caller-provided device key (key file text) used instead of the key
+    /// file, for apps that keep it in their own store.
+    device_key: ?[]const u8 = null,
     /// No device key and no `device` header: a plain key connection.
+    /// $HUB_DEVICE=0 (or off, false, no) does the same.
     disable_device: bool = false,
 };
 
@@ -216,8 +240,6 @@ pub const Service = struct {
     instance_option: ?[]const u8 = null,
     device_name: ?[]const u8 = null,
     parent: ?[]const u8 = null,
-    /// The first registered path (owned by `paths`).
-    first_path: ?[]const u8 = null,
     /// The current `device` header (owned) and its expiry.
     certificate: ?[]u8 = null,
     certificate_exp: i64 = 0,
@@ -259,8 +281,10 @@ pub const Service = struct {
         errdefer keychain.deinit();
 
         var device_key: ?device.DeviceKey = null;
-        if (!options.disable_device) {
-            if (options.device_key_path) |path| {
+        if (!options.disable_device and device.modeEnabled(allocator)) {
+            if (options.device_key) |key_file| {
+                device_key = try device.DeviceKey.fromKeyFile(allocator, key_file);
+            } else if (options.device_key_path) |path| {
                 device_key = try device.DeviceKey.init(allocator, path);
             } else if (try device.defaultPath(allocator)) |path| {
                 defer allocator.free(path);
@@ -405,32 +429,37 @@ pub const Service = struct {
         return self;
     }
 
-    /// The address as a URL: a port becomes `ws://127.0.0.1:<port>`. Hub key
-    /// pins are stored under it. Owned; free it.
-    pub fn addressUrl(self: *Service, allocator: Allocator) ![]u8 {
+    /// The key of this service's hub key pin (see normalizeHubAddress).
+    /// Owned; free it.
+    pub fn pinAddress(self: *Service, allocator: Allocator) ![]u8 {
         return switch (self.address) {
-            .port => |port| std.fmt.allocPrint(allocator, "ws://127.0.0.1:{d}", .{port}),
-            .url => |url| allocator.dupe(u8, url),
+            .port => |port| std.fmt.allocPrint(allocator, "ws://localhost:{d}", .{port}),
+            .url => |url| normalizeHubAddress(allocator, url),
         };
     }
 
     /// The instance name in the device certificate: the `instance` option,
-    /// else the profile name, else the first segment of the first registered
-    /// path, else "service". Borrowed from the Service.
-    pub fn instance(self: *const Service) []const u8 {
+    /// else $HUB_INSTANCE, else the profile name, else the basename of the
+    /// working directory, else "service". Owned; free it.
+    pub fn instance(self: *const Service, allocator: Allocator) ![]u8 {
         if (self.instance_option) |value| {
-            if (value.len > 0) return value;
+            if (value.len > 0) return allocator.dupe(u8, value);
         }
+        if (std.process.getEnvVarOwned(allocator, "HUB_INSTANCE")) |value| {
+            if (value.len > 0) return value;
+            allocator.free(value);
+        } else |_| {}
         if (self.profile) |profile| {
             if (profile.name) |name| {
-                if (name.len > 0) return name;
+                if (name.len > 0) return allocator.dupe(u8, name);
             }
         }
-        if (self.first_path) |path| {
-            const segment = path[0 .. std.mem.indexOfScalar(u8, path, '/') orelse path.len];
-            if (segment.len > 0) return segment;
-        }
-        return "service";
+        if (std.process.getCwdAlloc(allocator)) |cwd| {
+            defer allocator.free(cwd);
+            const name = std.fs.path.basename(cwd);
+            if (name.len > 0) return allocator.dupe(u8, name);
+        } else |_| {}
+        return allocator.dupe(u8, "service");
     }
 
     /// The `device` header for a connect at `now`: the current certificate,
@@ -445,13 +474,19 @@ pub const Service = struct {
         defer self.allocator.free(service_key);
         const device_spki = try device_key.publicKey();
         defer self.allocator.free(device_spki);
-        var host: [std.posix.HOST_NAME_MAX]u8 = undefined;
-        const device_name = self.device_name orelse device.hostName(&host);
-        const parent: ?[]const u8 = if (self.parent) |parent| (if (parent.len > 0) device.truncate(parent, 64) else null) else null;
+        const default_name = if (self.device_name == null) try device.defaultName(self.allocator) else null;
+        defer if (default_name) |name| self.allocator.free(name);
+        const device_name = self.device_name orelse default_name;
+        const parent_env = if (self.parent == null) std.process.getEnvVarOwned(self.allocator, "HUB_DEVICE_PARENT") catch null else null;
+        defer if (parent_env) |value| self.allocator.free(value);
+        const parent_name = self.parent orelse parent_env;
+        const parent: ?[]const u8 = if (parent_name) |parent| (if (parent.len > 0) device.truncate(parent, 64) else null) else null;
+        const instance_name = try self.instance(self.allocator);
+        defer self.allocator.free(instance_name);
         const header = try device_key.sign(.{
             .device = device_spki,
             .service = service_key,
-            .instance = device.truncate(self.instance(), 128),
+            .instance = device.truncate(instance_name, 128),
             .deviceName = if (device_name) |name| device.truncate(name, 64) else null,
             .platform = device.platform(),
             .parent = parent,
@@ -470,7 +505,7 @@ pub const Service = struct {
     pub fn forgetHubKey(self: *Service) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const address = try self.addressUrl(self.allocator);
+        const address = try self.pinAddress(self.allocator);
         defer self.allocator.free(address);
         try self.keychain.forgetHubKey(address);
     }
@@ -545,7 +580,6 @@ pub const Service = struct {
             } else {
                 gop.key_ptr.* = owned;
                 stored_path = owned;
-                if (self.first_path == null) self.first_path = owned;
             }
         }
         if (settings) |st| {
@@ -605,7 +639,7 @@ pub const Service = struct {
     /// channel client memcpys this verbatim after the standard headers.
     /// hub-lite ignores these headers. Owned; free it.
     pub fn connectHeaderBlock(self: *Service) ![]u8 {
-        const address = try self.addressUrl(self.allocator);
+        const address = try self.pinAddress(self.allocator);
         defer self.allocator.free(address);
         const hub_key = try self.keychain.hubKey(address);
         defer if (hub_key) |key| self.allocator.free(key);
@@ -636,7 +670,7 @@ pub const Service = struct {
         if (info != .object) return false;
         const key = info.object.get("key") orelse return false;
         if (key != .string or key.string.len == 0) return false;
-        const address = self.addressUrl(self.allocator) catch return false;
+        const address = self.pinAddress(self.allocator) catch return false;
         defer self.allocator.free(address);
         self.keychain.pinHubKey(address, key.string) catch return false;
         return true;

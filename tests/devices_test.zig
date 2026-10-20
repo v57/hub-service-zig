@@ -168,30 +168,69 @@ fn noopHandler(request: hub_service.PostRequest(?*Service, Value, void)) !?Value
     return request.body;
 }
 
+fn expectInstance(svc: *const Service, expected: []const u8) !void {
+    const instance = try svc.instance(testing.allocator);
+    defer testing.allocator.free(instance);
+    try testing.expectEqualStrings(expected, instance);
+}
+
 test "device: instance defaults" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    {
+    // zig build runs the tests in the package directory; $HUB_INSTANCE is unset here.
+    if (std.process.getEnvVarOwned(testing.allocator, "HUB_INSTANCE")) |value| {
+        testing.allocator.free(value);
+    } else |_| {
         var svc = try Service.init(testing.allocator, .{ .key_path = fixture.auth_path, .disable_device = true });
         defer svc.deinit();
-        try testing.expectEqualStrings("service", svc.instance());
         _ = try svc.post("s3/read", noopHandler, null);
-        _ = try svc.post("a/b", noopHandler, null);
-        try testing.expectEqualStrings("s3", svc.instance());
-    }
-    {
-        var svc = try Service.init(testing.allocator, .{ .key_path = fixture.auth_path, .disable_device = true, .name = "Backup Disk" });
-        defer svc.deinit();
-        _ = try svc.post("s3/read", noopHandler, null);
-        try testing.expectEqualStrings("Backup Disk", svc.instance());
+        try expectInstance(&svc, "hub-service-zig");
+
+        var named = try Service.init(testing.allocator, .{ .key_path = fixture.auth_path, .disable_device = true, .name = "Backup Disk" });
+        defer named.deinit();
+        try expectInstance(&named, "Backup Disk");
     }
     {
         var svc = try Service.init(testing.allocator, .{ .key_path = fixture.auth_path, .disable_device = true, .name = "Backup Disk", .instance = "s3-local/Backup Disk" });
         defer svc.deinit();
-        try testing.expectEqualStrings("s3-local/Backup Disk", svc.instance());
+        try expectInstance(&svc, "s3-local/Backup Disk");
         try testing.expect((try svc.currentCertificate(0)) == null);
     }
     try testing.expectEqualStrings("ab", hub_service.device.truncate("ab\xc3\xa9", 3));
+}
+
+test "device: a caller-provided key reads no file" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var svc = try Service.init(testing.allocator, .{
+        .key_path = fixture.auth_path,
+        .device_key_path = fixture.device_path,
+        .device_key = "MC4CAQAwBQYDK2VwBCIEIAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDMCowBQYDK2VwAyEA7UkoxijRwsbq6QM4kFmVYSlZJzpcY/k2NsFGFKyHN9E=",
+        .instance = "x",
+    });
+    defer svc.deinit();
+    var parsed = try certificatePayload((try svc.currentCertificate(1)).?);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("MCowBQYDK2VwAyEA7UkoxijRwsbq6QM4kFmVYSlZJzpcY/k2NsFGFKyHN9E=", parsed.value.object.get("device").?.string);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access("device.key", .{}));
+}
+
+test "pin addresses are normalized" {
+    const cases = [_][2][]const u8{
+        .{ "1997", "ws://localhost:1997" },
+        .{ "WSS://Hub.Example.COM/", "wss://hub.example.com" },
+        .{ "ws://Host:80/Path/", "ws://host:80/Path" },
+    };
+    for (cases) |case| {
+        const address = try hub_service.normalizeHubAddress(testing.allocator, case[0]);
+        defer testing.allocator.free(address);
+        try testing.expectEqualStrings(case[1], address);
+    }
+    var svc = try Service.init(testing.allocator, .{ .address = .{ .port = 1997 }, .disable_device = true });
+    defer svc.deinit();
+    const address = try svc.pinAddress(testing.allocator);
+    defer testing.allocator.free(address);
+    try testing.expectEqualStrings("ws://localhost:1997", address);
 }
 
 test "vectors: caller" {
@@ -417,7 +456,7 @@ test "fake hub: learns and pins the hub key, then connects with v1" {
     try testing.expectEqualStrings("0", Connect.get(&connects[0].v, connects[0].v_len));
     try testing.expectEqualStrings("1", Connect.get(&connects[1].v, connects[1].v_len));
 
-    const address = try svc.addressUrl(testing.allocator);
+    const address = try svc.pinAddress(testing.allocator);
     defer testing.allocator.free(address);
     const pinned = (try svc.keychain.hubKey(address)).?;
     defer testing.allocator.free(pinned);
@@ -442,7 +481,7 @@ test "fake hub: a pinned hub connects once with v1" {
 
     var svc = try fixture.service(&hub);
     defer svc.deinit();
-    const address = try svc.addressUrl(testing.allocator);
+    const address = try svc.pinAddress(testing.allocator);
     defer testing.allocator.free(address);
     try svc.keychain.pinHubKey(address, HUB_KEY);
     _ = try svc.start();

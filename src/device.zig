@@ -106,8 +106,38 @@ pub fn platform() []const u8 {
     };
 }
 
-/// The host name without a trailing ".local" (the default device name),
-/// in `buffer`; null when unavailable.
+/// False when $HUB_DEVICE turns device mode off (0, off, false, no).
+pub fn modeEnabled(allocator: Allocator) bool {
+    const value = std.process.getEnvVarOwned(allocator, "HUB_DEVICE") catch return true;
+    defer allocator.free(value);
+    for ([_][]const u8{ "0", "off", "false", "no" }) |off| {
+        if (std.ascii.eqlIgnoreCase(value, off)) return false;
+    }
+    return true;
+}
+
+/// The default device name: $HUB_DEVICE_NAME, else the macOS computer name
+/// (scutil --get ComputerName), else the host name. Owned; free it.
+pub fn defaultName(allocator: Allocator) !?[]u8 {
+    if (std.process.getEnvVarOwned(allocator, "HUB_DEVICE_NAME")) |name| {
+        if (name.len > 0) return name;
+        allocator.free(name);
+    } else |_| {}
+    if (builtin.os.tag == .macos) {
+        if (std.process.Child.run(.{ .allocator = allocator, .argv = &.{ "scutil", "--get", "ComputerName" } })) |result| {
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            const name = std.mem.trim(u8, result.stdout, " \r\n\t");
+            if (result.term == .Exited and result.term.Exited == 0 and name.len > 0) return try allocator.dupe(u8, name);
+        } else |_| {}
+    }
+    var buffer: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const host = hostName(&buffer) orelse return null;
+    return try allocator.dupe(u8, host);
+}
+
+/// The host name without a trailing ".local", in `buffer`; null when
+/// unavailable.
 pub fn hostName(buffer: *[std.posix.HOST_NAME_MAX]u8) ?[]const u8 {
     if (builtin.os.tag == .windows) return null;
     const name = std.posix.gethostname(buffer) catch return null;
@@ -147,6 +177,12 @@ pub const DeviceKey = struct {
 
     pub fn init(allocator: Allocator, path: []const u8) !DeviceKey {
         return .{ .allocator = allocator, .path = try allocator.dupe(u8, path) };
+    }
+
+    /// A caller-provided device key (key file text) for apps that keep it in
+    /// their own store; no file is read or created. Its path is empty.
+    pub fn fromKeyFile(allocator: Allocator, key_file: []const u8) !DeviceKey {
+        return .{ .allocator = allocator, .path = try allocator.dupe(u8, ""), .key = try keychain.parseKeyFile(key_file) };
     }
 
     pub fn deinit(self: *DeviceKey) void {
