@@ -83,6 +83,13 @@ pub const Keychain = struct {
         return tokenFromKey(self.allocator, bytes[0..KEY_FILE_LENGTH].*, hub_key, std.time.timestamp() + expires);
     }
 
+    /// The base64 signature of the service key over `data` (the hub-net
+    /// agent's challenge nonce, for example). Owned; free it.
+    pub fn signData(self: *Keychain, data: []const u8) ![]u8 {
+        const bytes = try self.loadBytes();
+        return signBase64(self.allocator, bytes[0..KEY_FILE_LENGTH].*, data);
+    }
+
     /// The hub key pinned for `address`, or null. Owned; free it.
     pub fn hubKey(self: *Keychain, address: []const u8) !?[]u8 {
         var pins = try self.readPins();

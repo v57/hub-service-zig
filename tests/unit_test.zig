@@ -8,6 +8,7 @@ const testing = std.testing;
 
 test {
     _ = @import("devices_test.zig");
+    _ = @import("network_test.zig");
 }
 const Service = hub_service.Service;
 const Value = std.json.Value;

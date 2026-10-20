@@ -22,6 +22,8 @@ const std = @import("std");
 pub const channel = @import("channel");
 const keychain_mod = @import("keychain.zig");
 pub const device = @import("device.zig");
+pub const network = @import("network.zig");
+pub const NetworkShare = network.NetworkShare;
 
 pub const Keychain = keychain_mod.Keychain;
 pub const PRIVATE_DER_LENGTH = keychain_mod.PRIVATE_DER_LENGTH;
@@ -170,6 +172,9 @@ pub const ServiceOptions = struct {
     /// No device key and no `device` header: a plain key connection.
     /// $HUB_DEVICE=0 (or off, false, no) does the same.
     disable_device: bool = false,
+    /// The hub-net agent socket for share publishing (default
+    /// /var/run/hub-net/agent.sock on macOS, /run/hub-net/agent.sock elsewhere).
+    agent_socket: ?[]const u8 = null,
 };
 
 /// Sent to the hub as hub/profile/update on every (re)connect.
@@ -243,6 +248,8 @@ pub const Service = struct {
     /// The current `device` header (owned) and its expiry.
     certificate: ?[]u8 = null,
     certificate_exp: i64 = 0,
+    /// Declared Hub Network shares and their publications.
+    shares: network.Publisher,
 
     /// Creates a Service. Address defaults to 1997, or $HUB when set.
     pub fn init(allocator: Allocator, options: ServiceOptions) !Service {
@@ -293,6 +300,9 @@ pub const Service = struct {
         }
         errdefer if (device_key) |*key| key.deinit();
 
+        var shares = try network.Publisher.init(allocator, options.agent_socket);
+        errdefer shares.deinit();
+
         return .{
             .allocator = allocator,
             .ch = channel.Channel(?*Service).init(allocator),
@@ -302,6 +312,7 @@ pub const Service = struct {
             .owned_key_env = owned_key_env,
             .keychain = keychain,
             .device_key = device_key,
+            .shares = shares,
             .instance_option = options.instance,
             .device_name = options.device_name,
             .parent = options.parent,
@@ -317,6 +328,7 @@ pub const Service = struct {
         self.keychain.deinit();
         if (self.device_key) |*key| key.deinit();
         if (self.certificate) |certificate| self.allocator.free(certificate);
+        self.shares.deinit();
 
         self.apps.deinit(self.allocator);
 
@@ -497,6 +509,61 @@ pub const Service = struct {
         self.certificate = header;
         self.certificate_exp = now + device.CERTIFICATE_LIFETIME;
         return header;
+    }
+
+    /// Declares a Hub Network share before start(): the complete declared set
+    /// is published on connect and after every reconnect. On
+    /// error.ShareFailed, shareError() says why.
+    pub fn share(self: *Service, share_config: NetworkShare) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.shares.declare(share_config);
+    }
+
+    /// Publishes (or updates) a share now: the local hub-net agent attests it
+    /// and the hub publishes the whole declared set. On failure the set is
+    /// left as it was; on error.ShareFailed, shareError() says why.
+    pub fn publishShare(self: *Service, share_config: NetworkShare) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.client == null or !self.client.?.isConnected()) return error.ServiceNotStarted;
+        try self.shares.publish(share_config, &self.keychain, self, replaceShares);
+    }
+
+    /// Removes a share and publishes the remaining set.
+    pub fn removeShare(self: *Service, name: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.client == null or !self.client.?.isConnected()) return error.ServiceNotStarted;
+        try self.shares.remove(name, &self.keychain, self, replaceShares);
+    }
+
+    /// The current publications as a JSON array of {version, resourceId,
+    /// authority, providerId, protocol, overlayAddress, port} in share-name
+    /// order. Owned; free it.
+    pub fn sharePublications(self: *Service, allocator: Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return allocator.dupe(u8, self.shares.publications);
+    }
+
+    /// Why the last share operation failed with error.ShareFailed.
+    pub fn shareError(self: *Service) []const u8 {
+        return self.shares.failure.message();
+    }
+
+    /// network/shares/replace on the current client (the mutex is held).
+    fn replaceShares(context: *anyopaque, allocator: Allocator, body: Value) anyerror!Value {
+        const self: *Service = @ptrCast(@alignCast(context));
+        const client = &(self.client orelse return error.ServiceNotStarted);
+        var result = try client.send(allocator, std.json.Value, "network/shares/replace", body);
+        switch (result) {
+            .ok => |value| return value orelse .null,
+            .remote_err => |message| {
+                defer result.deinit(allocator);
+                return self.shares.failure.set("{s}", .{message});
+            },
+        }
     }
 
     /// Forgets the hub key pinned for this service's address. Use it when a
@@ -730,6 +797,11 @@ pub const Service = struct {
                         was_connected = false;
                         self.mutex.unlock();
                         continue;
+                    }
+                    if (self.shares.hasShares()) {
+                        self.shares.synchronize(&self.keychain, self, replaceShares) catch |err| {
+                            std.debug.print("hub-service: failed to republish network shares ({s}: {s})\n", .{ @errorName(err), self.shares.failure.message() });
+                        };
                     }
                 }
                 if (!connected) was_connected = false;
