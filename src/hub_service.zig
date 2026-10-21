@@ -1,8 +1,8 @@
 //! hub-service-zig: a lite Zig port of hub-service (TS reference).
 //!
-//! Connect to a hub (hub-lite/hub-pro), host post/stream API endpoints,
+//! Connect to a hub (hub-lite/hub-server), host post/stream API endpoints,
 //! register apps, and call API through the hub. On every (re)connect the
-//! service attaches a fresh hub-pro auth token (`auth` header) signed by the
+//! service attaches a fresh hub-server auth token (`auth` header) signed by the
 //! keychain `auth` file (TS parity with hub-service/keychain.ts) — hub-lite
 //! ignores these headers. With no hub key pinned for the address it connects
 //! with v0, asks hub/info for the hub key, pins it in hubs.json and

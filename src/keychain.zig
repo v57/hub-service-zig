@@ -1,4 +1,4 @@
-//! hub-pro keychain: load-or-generate the `auth` ed25519 key file, sign auth
+//! hub-server keychain: load-or-generate the `auth` ed25519 key file, sign auth
 //! tokens and pin hub keys (TS parity with hub-service/keychain.ts and
 //! Docs/Devices/protocol.md section 2).
 //!
@@ -12,7 +12,7 @@
 //!              v0 (hub_key null): `<expiry>`
 //!              v1: `hub1:<hub SPKI>:<expiry>` (only valid on that hub)
 //!   expiry = DECIMAL epoch-seconds string of now + expires (default 60;
-//!            hub-pro rejects it once 30 s past or more than 330 s ahead)
+//!            hub-server rejects it once 30 s past or more than 330 s ahead)
 //!
 //! The hub verifies the signature against the embedded public key and treats
 //! the key as the connection identity (owner/host/group permissions).
