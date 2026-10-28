@@ -222,7 +222,8 @@ fn generate(allocator: Allocator, path: []const u8, private_dirs: bool) !KeyByte
     if (std.fs.path.dirname(path)) |dir| {
         try std.fs.cwd().makePath(dir);
         if (private_dirs) {
-            var handle = try std.fs.cwd().openDir(dir, .{});
+            // .iterate opens a real descriptor: Linux's default O_PATH one can't fchmod (EBADF).
+            var handle = try std.fs.cwd().openDir(dir, .{ .iterate = true });
             defer handle.close();
             try handle.chmod(0o700);
         }
