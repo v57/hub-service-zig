@@ -126,7 +126,14 @@ test "vectors: device id and safety code" {
     const root = vectors.value;
     const key = vectorText(root, &.{ "keys", "device", "publicKey" });
     try testing.expectEqualStrings(vectorText(root, &.{ "keys", "device", "deviceId" }), &(try hub_service.device.deviceId(key)));
-    try testing.expectEqualStrings(vectorText(root, &.{ "keys", "device", "safetyCode" }), &(try hub_service.device.safetyCode(key)));
+    for (root.object.get("safetyCode").?.object.get("cases").?.array.items) |case| {
+        const field = struct {
+            fn get(value: std.json.Value, name: []const u8) []const u8 {
+                return value.object.get(name).?.string;
+            }
+        }.get;
+        try testing.expectEqualStrings(field(case, "code"), &(try hub_service.device.safetyCode(field(case, "hubKey"), field(case, "deviceKey"), field(case, "codeValue"))));
+    }
 }
 
 /// The certificate JSON inside a `device` header.

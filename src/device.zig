@@ -83,10 +83,13 @@ pub fn deviceId(spki: []const u8) ![32]u8 {
     return (try spkiDigest(spki))[0..32].*;
 }
 
-/// The safety code shown when approving a device: "ddd ddd".
-pub fn safetyCode(spki: []const u8) ![7]u8 {
-    const digest = try spkiDigest(spki);
-    const n = try std.fmt.parseInt(u32, digest[0..8], 16) % 1_000_000;
+/// The safety code shown when approving a device: "ddd ddd". `hub_key` is the key this side pinned, `code_value` what
+/// the hub picked after it had the device's key (`hub/device/request`).
+pub fn safetyCode(hub_key: []const u8, device_key: []const u8, code_value: []const u8) ![7]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for ([_][]const u8{ "hubcode1:", hub_key, ":", device_key, ":", code_value }) |part| hash.update(part);
+    const digest = hash.finalResult();
+    const n = std.mem.readInt(u32, digest[0..4], .big) % 1_000_000;
     var out: [7]u8 = undefined;
     _ = try std.fmt.bufPrint(&out, "{d:0>3} {d:0>3}", .{ n / 1000, n % 1000 });
     return out;
