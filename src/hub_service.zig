@@ -1,12 +1,13 @@
 //! hub-service-zig: a lite Zig port of hub-service (TS reference).
 //!
-//! Connect to a hub (hub-lite/hub-server), host post/stream API endpoints,
-//! register apps, and call API through the hub. On every (re)connect the
-//! service attaches a fresh hub-server auth token (`auth` header) signed by the
-//! keychain `auth` file (TS parity with hub-service/keychain.ts) — hub-lite
-//! ignores these headers. With no hub key pinned for the address it connects
-//! with v0, asks hub/info for the hub key, pins it in hubs.json and
-//! reconnects with a v1 token bound to that hub (Docs/Devices/protocol.md).
+//! Connect to a hub (hub-server), host post/stream API endpoints, register apps,
+//! and call API through the hub. Before every (re)connect the service asks
+//! hub/info with a fresh nonce on a short anonymous connection (see
+//! hub_proof.zig): only an answer with a valid proof of the key it claims gets a
+//! token (`auth` header), signed by the keychain `auth` file over that answer's
+//! challenge. The first proven key is pinned in hubs.json; a hub that doesn't
+//! prove its key, or proves another than the pinned one, gets nothing and holds
+//! the next attempt back (Docs/Devices/protocol.md section 2).
 //! Unless disabled, every connect also sends a certificate for the service
 //! key signed by the device key (see device.zig), renewed when less than a
 //! day is left. The wire contract matches the TS reference
@@ -23,6 +24,12 @@ pub const channel = @import("channel");
 const keychain_mod = @import("keychain.zig");
 pub const device = @import("device.zig");
 pub const network = @import("network.zig");
+const hub_proof = @import("hub_proof.zig");
+pub const HubTransport = hub_proof.HubTransport;
+pub const HubInfo = hub_proof.HubInfo;
+pub const hubTransportOf = hub_proof.hubTransportOf;
+pub const makeClientNonce = hub_proof.makeClientNonce;
+pub const hubInfoSignedData = hub_proof.hubInfoSignedData;
 pub const NetworkShare = network.NetworkShare;
 
 pub const Keychain = keychain_mod.Keychain;
@@ -30,6 +37,8 @@ pub const PRIVATE_DER_LENGTH = keychain_mod.PRIVATE_DER_LENGTH;
 pub const PUBLIC_DER_LENGTH = keychain_mod.PUBLIC_DER_LENGTH;
 pub const AUTH_EXPIRY = keychain_mod.AUTH_EXPIRY;
 pub const authToken = keychain_mod.authToken;
+pub const parseKeyFile = keychain_mod.parseKeyFile;
+pub const signBase64 = keychain_mod.signBase64;
 
 pub const Allocator = std.mem.Allocator;
 pub const Value = std.json.Value;
@@ -92,7 +101,7 @@ pub const Caller = struct {
     hub_key: ?[]const u8 = null,
 
     /// The caller in a request context; null when it has no hub caller
-    /// (hub-lite, or a call that didn't come through a hub).
+    /// (a call that didn't come through a hub).
     pub fn fromContext(context: Value) ?Caller {
         const hub = objectField(context, "hub") orelse return null;
         const caller = objectField(hub, "caller") orelse return null;
@@ -175,6 +184,10 @@ pub const ServiceOptions = struct {
     /// The hub-net agent socket for share publishing (default
     /// /var/run/hub-net/agent.sock on macOS, /run/hub-net/agent.sock elsewhere).
     agent_socket: ?[]const u8 = null,
+    /// Dial plain ws:// beyond loopback, the overlay and the LAN, which would
+    /// carry the key unencrypted: for private networks the SDK can't recognize,
+    /// such as a container's ws://hub:1997. $HUB_ALLOW_PLAINTEXT=1 does the same.
+    allow_plaintext: bool = false,
 };
 
 /// Sent to the hub as hub/profile/update on every (re)connect.
@@ -190,7 +203,7 @@ pub const AppHeader = struct {
     path: []const u8,
 };
 
-/// Pro-only wire-parity fields; hub-lite ignores them.
+/// hub-server's permission fields.
 pub const ServicePermissions = struct {
     group: ?[]const u8 = null,
     name: []const u8,
@@ -238,8 +251,11 @@ pub const Service = struct {
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
     mutex: std.Thread.Mutex = .{},
-    /// The current connection used a pinned hub key (v1).
-    hub_key_known: bool = false,
+    allow_plaintext: bool = false,
+    /// Why start dialed nothing (owned), or null.
+    refusal: ?[]u8 = null,
+    /// The failure last reported (owned): each distinct one goes out once.
+    last_failure: ?[]u8 = null,
     /// Null when device mode is off or there is no home directory.
     device_key: ?device.DeviceKey = null,
     instance_option: ?[]const u8 = null,
@@ -303,6 +319,12 @@ pub const Service = struct {
         var shares = try network.Publisher.init(allocator, options.agent_socket);
         errdefer shares.deinit();
 
+        var allow_plaintext = options.allow_plaintext;
+        if (std.process.getEnvVarOwned(allocator, "HUB_ALLOW_PLAINTEXT")) |env| {
+            defer allocator.free(env);
+            if (std.mem.eql(u8, env, "1")) allow_plaintext = true;
+        } else |_| {}
+
         return .{
             .allocator = allocator,
             .ch = channel.Channel(?*Service).init(allocator),
@@ -316,6 +338,7 @@ pub const Service = struct {
             .instance_option = options.instance,
             .device_name = options.device_name,
             .parent = options.parent,
+            .allow_plaintext = allow_plaintext,
         };
     }
 
@@ -323,6 +346,8 @@ pub const Service = struct {
         self.stop_flag.store(true, .release);
         if (self.poll_thread) |thread| thread.join();
         if (self.client) |*client| client.deinit();
+        if (self.refusal) |refusal| self.allocator.free(refusal);
+        if (self.last_failure) |failure| self.allocator.free(failure);
         if (self.owned_env) |env| self.allocator.free(env);
         if (self.owned_key_env) |env| self.allocator.free(env);
         self.keychain.deinit();
@@ -406,39 +431,71 @@ pub const Service = struct {
         return self;
     }
 
-    /// Calls an API through the hub. Errors with error.ServiceNotStarted if
-    /// the service has not been started (or is between reconnects).
+    /// Calls an API through the hub. Between connections it waits for one, also
+    /// while a hub that doesn't prove its key holds the attempts back. Errors with
+    /// error.ServiceNotStarted before start or once stopped, and with
+    /// error.WouldCarryKeyUnencrypted for an address start refused (see
+    /// plaintextRefusal).
     pub fn send(self: *Service, allocator: Allocator, path: []const u8, body: ?Value) !channel.CallResult(std.json.Value) {
-        self.mutex.lock();
+        const client = try self.waitForClient();
         defer self.mutex.unlock();
-        if (self.client == null) return error.ServiceNotStarted;
-        const client = &self.client.?;
         return client.send(allocator, std.json.Value, path, body orelse .null);
     }
 
-    /// Opens a stream call through the hub. Errors with error.ServiceNotStarted
-    /// if the service has not been started (or is between reconnects).
+    /// Opens a stream call through the hub. Waits and errors like send.
     /// NOTE: iterating the returned Values pumps the transport; with the poll
     /// thread running, do so from a single thread (the poll thread itself is
     /// the safe choice).
     pub fn values(self: *Service, allocator: Allocator, path: []const u8, body: ?Value) !channel.Values(std.json.Value) {
-        self.mutex.lock();
+        const client = try self.waitForClient();
         defer self.mutex.unlock();
-        if (self.client == null) return error.ServiceNotStarted;
-        const client = &self.client.?;
         return client.values(allocator, std.json.Value, std.json.Value, void, path, body orelse .null, {});
     }
 
-    /// Connects to the hub and starts the poll/reconnect loop. On every
+    /// The client once there is one, with the mutex held.
+    fn waitForClient(self: *Service) !*channel.Client(?*Service) {
+        while (true) {
+            self.mutex.lock();
+            if (self.refusal != null) {
+                self.mutex.unlock();
+                return error.WouldCarryKeyUnencrypted;
+            }
+            if (self.client != null) return &self.client.?;
+            const waiting = self.started and !self.stop_flag.load(.acquire);
+            self.mutex.unlock();
+            if (!waiting) return error.ServiceNotStarted;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
+    /// Asks the hub to prove its key and connects, then keeps the poll/reconnect
+    /// loop running: a failed attempt holds the next one back, from 1 s doubling
+    /// to 30 s, and each distinct failure goes to stderr once. On every
     /// isConnected false->true transition (per connection) it sends
-    /// hub/profile/update (if a profile is set) then hub/service/update.
+    /// hub/profile/update (if a profile is set) then hub/service/update. An
+    /// address that would carry the key unencrypted opens nothing (see
+    /// allow_plaintext).
     pub fn start(self: *Service) !*Service {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.started) return self;
+        if (self.started or self.refusal != null) return self;
+        if (!self.allow_plaintext and self.address == .url and hub_proof.hubTransportOf(self.address.url) == .refused) {
+            self.refusal = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} would carry this service's key unencrypted. Use wss://, or set allow_plaintext (HUB_ALLOW_PLAINTEXT=1) on a private network",
+                .{self.address.url},
+            );
+            std.debug.print("hub-service: {s}\n", .{self.refusal.?});
+            return self;
+        }
         self.started = true;
         self.poll_thread = try std.Thread.spawn(.{}, Service.pollLoop, .{self});
         return self;
+    }
+
+    /// Why start dialed nothing, or null.
+    pub fn plaintextRefusal(self: *const Service) ?[]const u8 {
+        return self.refusal;
     }
 
     /// The key of this service's hub key pin (see normalizeHubAddress).
@@ -566,9 +623,8 @@ pub const Service = struct {
         }
     }
 
-    /// Forgets the hub key pinned for this service's address. Use it when a
-    /// v1 connect keeps failing with `invalid signature` because the hub's
-    /// key changed on purpose; the next connect learns it again.
+    /// Forgets the hub key pinned for this service's address, for a hub whose key
+    /// changed on purpose. The next connect pins what the hub proves.
     pub fn forgetHubKey(self: *Service) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -577,7 +633,8 @@ pub const Service = struct {
         try self.keychain.forgetHubKey(address);
     }
 
-    /// Requests the poll loop to stop (used by deinit).
+    /// Requests the poll loop to stop (used by deinit), and ends the calls waiting
+    /// for a connection.
     pub fn stop(self: *Service) void {
         self.stop_flag.store(true, .release);
     }
@@ -700,18 +757,13 @@ pub const Service = struct {
         }
     }
 
-    /// A fresh raw header block for the HTTP upgrade request: the auth token
-    /// (built per connect — the token embeds an expiry; v1 when a hub key is
-    /// pinned for the address, else v0) plus the protocol version. The
-    /// channel client memcpys this verbatim after the standard headers.
-    /// hub-lite ignores these headers. Owned; free it.
-    pub fn connectHeaderBlock(self: *Service) ![]u8 {
-        const address = try self.pinAddress(self.allocator);
-        defer self.allocator.free(address);
-        const hub_key = try self.keychain.hubKey(address);
-        defer if (hub_key) |key| self.allocator.free(key);
-        self.hub_key_known = hub_key != null;
-        const token = try self.keychain.signForHub(hub_key, AUTH_EXPIRY);
+    /// A fresh raw header block for a connect to the hub with key `hub_key`, over
+    /// the challenge it answered: the auth token (a challenge is good for one
+    /// connection, so it's built per connect), the protocol version and the
+    /// device certificate. The channel client memcpys this verbatim after the
+    /// standard headers. Owned; free it.
+    pub fn connectHeaderBlock(self: *Service, hub_key: []const u8, challenge: []const u8) ![]u8 {
+        const token = try self.keychain.signForHub(hub_key, challenge, AUTH_EXPIRY);
         defer self.allocator.free(token);
         // A device key that can't be read or created leaves a plain key
         // connection.
@@ -720,31 +772,97 @@ pub const Service = struct {
             break :blk null;
         };
         if (certificate) |header| {
-            return std.fmt.allocPrint(self.allocator, "auth: {s}\r\nv: {s}\r\ndevice: {s}\r\n", .{ token, if (hub_key != null) "1" else "0", header });
+            return std.fmt.allocPrint(self.allocator, "auth: {s}\r\nv: 1\r\ndevice: {s}\r\n", .{ token, header });
         }
-        return std.fmt.allocPrint(self.allocator, "auth: {s}\r\nv: {s}\r\n", .{ token, if (hub_key != null) "1" else "0" });
+        return std.fmt.allocPrint(self.allocator, "auth: {s}\r\nv: 1\r\n", .{token});
     }
 
-    /// Asks hub/info for the hub key and pins it. True when a key was pinned
-    /// (the caller reconnects with v1); hub-lite answers with an error.
-    fn learnHubKey(self: *Service, client: *channel.Client(?*Service)) bool {
-        var result = client.send(self.allocator, std.json.Value, "hub/info", {}) catch return false;
-        defer result.deinit(self.allocator);
-        const info = switch (result) {
-            .ok => |value| value orelse return false,
-            .remote_err => return false,
+    const Handshake = union(enum) {
+        /// The header block for this answer alone. Owned.
+        headers: []u8,
+        /// Why the hub gets nothing. Owned.
+        failure: []u8,
+    };
+
+    /// Runs before every connection attempt (protocol.md section 2): asks the hub
+    /// for its proof, pins a first key, refuses another than the pinned one, and
+    /// builds the headers for that answer alone.
+    fn handshake(self: *Service) !Handshake {
+        const allocator = self.allocator;
+        const address = try self.pinAddress(allocator);
+        defer allocator.free(address);
+        const asked = switch (self.address) {
+            .port => |port| hub_proof.askHub(allocator, port),
+            .url => |url| hub_proof.askHub(allocator, url),
         };
-        if (info != .object) return false;
-        const key = info.object.get("key") orelse return false;
-        if (key != .string or key.string.len == 0) return false;
-        const address = self.pinAddress(self.allocator) catch return false;
-        defer self.allocator.free(address);
-        self.keychain.pinHubKey(address, key.string) catch return false;
-        return true;
+        const hub = asked catch |err| {
+            const reason = if (err == error.HubDidNotProveKey) "hub didn't prove its key" else @errorName(err);
+            return .{ .failure = try std.fmt.allocPrint(allocator, "{s}: {s}, sending it nothing", .{ address, reason }) };
+        };
+        defer hub.deinit(allocator);
+        if (try self.keychain.hubKey(address)) |pinned| {
+            defer allocator.free(pinned);
+            if (!std.mem.eql(u8, pinned, hub.key)) {
+                return .{ .failure = try std.fmt.allocPrint(
+                    allocator,
+                    "{s} answers with key {s}, not the pinned {s}, sending it nothing. forgetHubKey if its key really changed",
+                    .{ address, hub.key, pinned },
+                ) };
+            }
+        } else {
+            try self.keychain.pinHubKey(address, hub.key);
+        }
+        return .{ .headers = try self.connectHeaderBlock(hub.key, hub.challenge) };
+    }
+
+    /// One attempt: the proof first, then the hub. Null when it failed, reported.
+    fn dial(self: *Service) ?channel.Client(?*Service) {
+        const outcome = self.handshake() catch |err| {
+            self.reportFailure(@errorName(err));
+            return null;
+        };
+        switch (outcome) {
+            .failure => |failure| {
+                defer self.allocator.free(failure);
+                self.reportFailure(failure);
+                return null;
+            },
+            .headers => |headers| {
+                defer self.allocator.free(headers);
+                const connected = switch (self.address) {
+                    .port => |port| self.ch.connect(self.allocator, port, .{ .state = self, .headers = headers }),
+                    .url => |url| self.ch.connect(self.allocator, url, .{ .state = self, .headers = headers }),
+                };
+                return connected catch |err| {
+                    self.reportFailure(@errorName(err));
+                    return null;
+                };
+            },
+        }
+    }
+
+    /// Reports a failure that differs from the last one.
+    fn reportFailure(self: *Service, message: []const u8) void {
+        if (self.last_failure) |last| {
+            if (std.mem.eql(u8, last, message)) return;
+            self.allocator.free(last);
+            self.last_failure = null;
+        }
+        std.debug.print("hub-service: {s}\n", .{message});
+        self.last_failure = self.allocator.dupe(u8, message) catch null;
+    }
+
+    /// Waits before the next attempt, or until stop.
+    fn holdBack(self: *Service, seconds: u64) void {
+        var waited: u64 = 0;
+        while (waited < seconds * 100 and !self.stop_flag.load(.acquire)) : (waited += 1) {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
     }
 
     fn pollLoop(self: *Service) void {
         var was_connected = false;
+        var retry_delay: u64 = 1;
         while (!self.stop_flag.load(.acquire)) {
             self.mutex.lock();
             {
@@ -755,23 +873,13 @@ pub const Service = struct {
                     }
                 }
                 if (self.client == null) {
-                    const headers = self.connectHeaderBlock() catch |err| {
-                        std.debug.print("hub-service: auth token failed ({s}); retrying in 1s\n", .{@errorName(err)});
+                    self.client = self.dial();
+                    if (self.client == null) {
                         self.mutex.unlock();
-                        std.Thread.sleep(1 * std.time.ns_per_s);
+                        self.holdBack(retry_delay);
+                        retry_delay = @min(retry_delay * 2, 30);
                         continue;
-                    };
-                    defer self.allocator.free(headers);
-                    const new_client = switch (self.address) {
-                        .port => |port| self.ch.connect(self.allocator, port, .{ .state = self, .headers = headers }),
-                        .url => |url| self.ch.connect(self.allocator, url, .{ .state = self, .headers = headers }),
-                    } catch |err| {
-                        std.debug.print("hub-service: connect failed ({s}); retrying in 1s\n", .{@errorName(err)});
-                        self.mutex.unlock();
-                        std.Thread.sleep(1 * std.time.ns_per_s);
-                        continue;
-                    };
-                    self.client = new_client;
+                    }
                     was_connected = false;
                 }
                 const client = &self.client.?;
@@ -786,18 +894,15 @@ pub const Service = struct {
                 };
                 const connected = client.isConnected();
                 if (connected and !was_connected) {
+                    retry_delay = 1;
+                    if (self.last_failure) |failure| {
+                        self.allocator.free(failure);
+                        self.last_failure = null;
+                    }
                     self.sendUpdates(client) catch |err| {
                         std.debug.print("hub-service: update send failed ({s})\n", .{@errorName(err)});
                     };
                     was_connected = true;
-                    if (!self.hub_key_known and self.learnHubKey(client)) {
-                        // Reconnect at once with the hub-bound v1 token.
-                        client.deinit();
-                        self.client = null;
-                        was_connected = false;
-                        self.mutex.unlock();
-                        continue;
-                    }
                     if (self.shares.hasShares()) {
                         self.shares.synchronize(&self.keychain, self, replaceShares) catch |err| {
                             std.debug.print("hub-service: failed to republish network shares ({s}: {s})\n", .{ @errorName(err), self.shares.failure.message() });

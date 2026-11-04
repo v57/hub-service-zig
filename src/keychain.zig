@@ -6,13 +6,14 @@
 //! the base64 encoding of the 48-byte PKCS8 DER ed25519 private key followed
 //! by the 44-byte SPKI DER public key (92 bytes total, 124 base64 chars).
 //!
-//! signForHub(hub_key, expires) produces `key.<pub>.<sig>.<expiry>`:
+//! signForHub(hub_key, nonce, expires) produces
+//! `key.<pub>.<sig>.<expiry>.<nonce>`:
 //!   pub    = base64 of the 44-byte SPKI public key (bytes 48..92 of the file)
-//!   sig    = base64 ed25519 signature over
-//!              v0 (hub_key null): `<expiry>`
-//!              v1: `hub1:<hub SPKI>:<expiry>` (only valid on that hub)
-//!   expiry = DECIMAL epoch-seconds string of now + expires (default 60;
-//!            hub-server rejects it once 30 s past or more than 330 s ahead)
+//!   nonce  = the challenge the hub answered in hub/info
+//!   sig    = base64 ed25519 signature over `hub1:<hub SPKI>:<nonce>:<expiry>`
+//!            (one connection to one hub)
+//!   expiry = DECIMAL epoch-seconds string of now + expires (default 30;
+//!            hub-server rejects it once 30 s past or more than 90 s ahead)
 //!
 //! The hub verifies the signature against the embedded public key and treats
 //! the key as the connection identity (owner/host/group permissions).
@@ -24,8 +25,9 @@ const std = @import("std");
 
 pub const Allocator = std.mem.Allocator;
 
-/// Seconds a fresh token stays valid (protocol.md: SDK default now + 60).
-pub const AUTH_EXPIRY = 60;
+/// Seconds a fresh token stays valid: a token is for one connect, and hubs
+/// accept at most 60 s.
+pub const AUTH_EXPIRY = 30;
 
 /// TS keychain layout: PKCS8 DER private key (48 bytes for ed25519) followed
 /// by SPKI DER public key (44 bytes for ed25519).
@@ -38,7 +40,7 @@ pub const KEY_FILE_LENGTH = PRIVATE_DER_LENGTH + PUBLIC_DER_LENGTH;
 ///                   OCTET STRING { OCTET STRING { 32-byte seed } } }
 /// SPKI:  SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING { pub } }
 const PKCS8_PREFIX = "\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x70\x04\x22\x04\x20";
-const SPKI_PREFIX = "\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00";
+pub const SPKI_PREFIX = "\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00";
 
 const Ed25519 = std.crypto.sign.Ed25519;
 
@@ -72,15 +74,11 @@ pub const Keychain = struct {
         return encodeBase64(self.allocator, bytes[PRIVATE_DER_LENGTH..KEY_FILE_LENGTH]);
     }
 
-    /// A fresh v0 auth token: `key.<pub>.<sig>.<expiry>`. Owned; free it.
-    pub fn sign(self: *Keychain, expires: i64) ![]u8 {
-        return self.signForHub(null, expires);
-    }
-
-    /// A fresh token bound to `hub_key` (v1); null signs v0. Owned; free it.
-    pub fn signForHub(self: *Keychain, hub_key: ?[]const u8, expires: i64) ![]u8 {
+    /// A fresh token for one connection to the hub with key `hub_key`, over the
+    /// challenge it answered in hub/info. Owned; free it.
+    pub fn signForHub(self: *Keychain, hub_key: []const u8, nonce: []const u8, expires: i64) ![]u8 {
         const bytes = try self.loadBytes();
-        return tokenFromKey(self.allocator, bytes[0..KEY_FILE_LENGTH].*, hub_key, std.time.timestamp() + expires);
+        return tokenFromKey(self.allocator, bytes[0..KEY_FILE_LENGTH].*, hub_key, nonce, std.time.timestamp() + expires);
     }
 
     /// The base64 signature of the service key over `data` (the hub-net
@@ -107,8 +105,8 @@ pub const Keychain = struct {
         try self.writePins(pins.value);
     }
 
-    /// Removes the pin for `address`: connects use v0 again until hub/info
-    /// pins the key again. Use it when the hub's key changed on purpose.
+    /// Removes the pin for `address`, for a hub whose key changed on purpose. The
+    /// next connect pins what the hub proves.
     pub fn forgetHubKey(self: *Keychain, address: []const u8) !void {
         var pins = try self.readPins();
         defer pins.deinit();
@@ -155,23 +153,20 @@ pub const Keychain = struct {
     }
 };
 
-/// An auth token for an explicit key file text and expiry (for tests and
-/// tools): `hub_key` null signs v0, otherwise v1. Owned; free it.
-pub fn authToken(allocator: Allocator, key_file: []const u8, hub_key: ?[]const u8, expiry: i64) ![]u8 {
-    return tokenFromKey(allocator, try parseKeyFile(key_file), hub_key, expiry);
+/// An auth token for an explicit key file text, hub challenge and expiry (for
+/// tests and tools). Owned; free it.
+pub fn authToken(allocator: Allocator, key_file: []const u8, hub_key: []const u8, nonce: []const u8, expiry: i64) ![]u8 {
+    return tokenFromKey(allocator, try parseKeyFile(key_file), hub_key, nonce, expiry);
 }
 
-fn tokenFromKey(allocator: Allocator, key: KeyBytes, hub_key: ?[]const u8, expiry: i64) ![]u8 {
-    const data = if (hub_key) |hub|
-        try std.fmt.allocPrint(allocator, "hub1:{s}:{d}", .{ hub, expiry })
-    else
-        try std.fmt.allocPrint(allocator, "{d}", .{expiry});
+fn tokenFromKey(allocator: Allocator, key: KeyBytes, hub_key: []const u8, nonce: []const u8, expiry: i64) ![]u8 {
+    const data = try std.fmt.allocPrint(allocator, "hub1:{s}:{s}:{d}", .{ hub_key, nonce, expiry });
     defer allocator.free(data);
     const sig_b64 = try signBase64(allocator, key, data);
     defer allocator.free(sig_b64);
     const pub_b64 = try encodeBase64(allocator, key[PRIVATE_DER_LENGTH..KEY_FILE_LENGTH]);
     defer allocator.free(pub_b64);
-    return std.fmt.allocPrint(allocator, "key.{s}.{s}.{d}", .{ pub_b64, sig_b64, expiry });
+    return std.fmt.allocPrint(allocator, "key.{s}.{s}.{d}.{s}", .{ pub_b64, sig_b64, expiry, nonce });
 }
 
 /// base64 ed25519 signature over `data` (deterministic, as TS). Owned.

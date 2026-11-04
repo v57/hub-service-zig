@@ -4,6 +4,7 @@
 const std = @import("std");
 const hub_service = @import("hub_service");
 const channel = hub_service.channel;
+const fake_hub = @import("fake_hub.zig");
 
 const testing = std.testing;
 const Service = hub_service.Service;
@@ -133,6 +134,14 @@ fn replyNull(_: channel.PostRequest(HubState, Value, void)) !?Value {
     return null;
 }
 
+var info_proof: [128]u8 = undefined;
+
+fn replyInfo(request: channel.PostRequest(HubState, Value, void)) !?fake_hub.Info {
+    const nonce = request.body.object.get("nonce").?.string;
+    const proof = try fake_hub.proof(std.heap.page_allocator, fake_hub.HUB_KEY_FILE, fake_hub.HUB_KEY, nonce, &info_proof);
+    return .{ .key = fake_hub.HUB_KEY, .proof = proof, .challenge = "challenge" };
+}
+
 fn replyReplace(request: channel.PostRequest(HubState, Value, void)) !?Value {
     hub_mutex.lock();
     defer hub_mutex.unlock();
@@ -188,6 +197,7 @@ const Fixture = struct {
         self.agent_path = try std.fs.path.join(testing.allocator, &.{ self.dir, "agent.sock" });
         self.ch = channel.Channel(HubState).init(testing.allocator);
         _ = try self.ch.post("hub/service/update", replyNull);
+        _ = try self.ch.post("hub/info", replyInfo);
         _ = try self.ch.post("network/shares/replace", replyReplace);
         self.server = try self.ch.listen(testing.allocator, 0, .{});
         const auth = try std.fs.path.join(testing.allocator, &.{ self.dir, "auth" });

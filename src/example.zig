@@ -1,6 +1,6 @@
 //! hub-service-zig echo example: post echo (identity), post echo/upper
 //! (uppercase), and an app at echo/ui with textField + cell + button.
-//! Run against a live hub (hub-lite on 1997).
+//! Run against a live hub (on 1997).
 
 const std = @import("std");
 const hub_service = @import("hub_service");
@@ -52,6 +52,6 @@ pub fn main() !void {
     });
 
     _ = try svc.start();
-    std.debug.print("echo service started (hub-lite :1997)\n", .{});
+    std.debug.print("echo service started (hub on :1997)\n", .{});
     while (true) std.Thread.sleep(1_000_000_000);
 }

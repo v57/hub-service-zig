@@ -10,7 +10,8 @@ const testing = std.testing;
 const Service = hub_service.Service;
 const Value = std.json.Value;
 
-const HUB_KEY = "MCowBQYDK2VwAyEAiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=";
+const fake_hub = @import("fake_hub.zig");
+const HUB_KEY = fake_hub.HUB_KEY;
 
 fn loadVectors() !std.json.Parsed(Value) {
     const text = try std.fs.cwd().readFileAlloc(testing.allocator, test_options.vectors_path, 1 << 20);
@@ -35,20 +36,58 @@ fn tmpPath(tmp: *std.testing.TmpDir, name: []const u8) ![]u8 {
     return std.fs.path.join(testing.allocator, &.{ dir, name });
 }
 
-test "vectors: auth v0 and v1 tokens" {
+test "vectors: auth token" {
     var vectors = try loadVectors();
     defer vectors.deinit();
     const root = vectors.value;
-    const key_file = vectorText(root, &.{ "keys", "service", "keyFile" });
-    const expiry = vector(root, &.{ "auth", "expiry" }).integer;
+    const token = try hub_service.authToken(
+        testing.allocator,
+        vectorText(root, &.{ "keys", "service", "keyFile" }),
+        vectorText(root, &.{ "keys", "hub", "publicKey" }),
+        vectorText(root, &.{ "auth", "nonce" }),
+        vector(root, &.{ "auth", "expiry" }).integer,
+    );
+    defer testing.allocator.free(token);
+    try testing.expectEqualStrings(vectorText(root, &.{ "auth", "v1", "header" }), token);
+}
 
-    const v0 = try hub_service.authToken(testing.allocator, key_file, null, expiry);
-    defer testing.allocator.free(v0);
-    try testing.expectEqualStrings(vectorText(root, &.{ "auth", "v0", "header" }), v0);
+test "vectors: hub/info proof" {
+    var vectors = try loadVectors();
+    defer vectors.deinit();
+    const root = vectors.value;
+    const hub_key = vectorText(root, &.{ "keys", "hub", "publicKey" });
+    const nonce = vectorText(root, &.{ "hubInfo", "nonce" });
+    const data = try hub_service.hubInfoSignedData(testing.allocator, hub_key, nonce);
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings(vectorText(root, &.{ "hubInfo", "signedData" }), data);
 
-    const v1 = try hub_service.authToken(testing.allocator, key_file, vectorText(root, &.{ "keys", "hub", "publicKey" }), expiry);
-    defer testing.allocator.free(v1);
-    try testing.expectEqualStrings(vectorText(root, &.{ "auth", "v1", "header" }), v1);
+    const proof = vectorText(root, &.{ "hubInfo", "proof" });
+    const info = hub_service.HubInfo{ .key = hub_key, .proof = proof, .challenge = "c" };
+    try testing.expect(info.proves(testing.allocator, nonce));
+    try testing.expect(!info.proves(testing.allocator, "another-nonce-another-nonce"));
+    const other = hub_service.HubInfo{ .key = vectorText(root, &.{ "keys", "service", "publicKey" }), .proof = proof, .challenge = "c" };
+    try testing.expect(!other.proves(testing.allocator, nonce));
+    const broken = hub_service.HubInfo{ .key = "not base64!", .proof = proof, .challenge = "c" };
+    try testing.expect(!broken.proves(testing.allocator, nonce));
+}
+
+test "vectors: transport" {
+    var vectors = try loadVectors();
+    defer vectors.deinit();
+    const cases = vectors.value.object.get("transport").?.array.items;
+    try testing.expect(cases.len > 0);
+    for (cases) |entry| {
+        const url = entry.object.get("url").?.string;
+        const expected = entry.object.get("transport").?.string;
+        testing.expectEqualStrings(expected, @tagName(hub_service.hubTransportOf(url))) catch |err| {
+            std.debug.print("transport of {s}\n", .{url});
+            return err;
+        };
+    }
+    try testing.expectEqual(hub_service.HubTransport.loopback, hub_service.hubTransportOf("1997"));
+    try testing.expectEqual(hub_service.HubTransport.refused, hub_service.hubTransportOf("hub:1997"));
+    try testing.expectEqual(hub_service.HubTransport.loopback, hub_service.hubTransportOf("WS://LOCALHOST.:1997"));
+    try testing.expectEqual(hub_service.HubTransport.localNetwork, hub_service.hubTransportOf("ws://me@10.0.0.2:1997/x"));
 }
 
 fn checkCertificate(name: []const u8, instance: []const u8, device_name: []const u8, platform: []const u8, parent: ?[]const u8) !void {
@@ -301,7 +340,18 @@ test "keychain: hub key pins live beside the key file" {
     try testing.expectEqualStrings("HUBKEY2", other);
 }
 
-test "keychain: signForHub binds the hub key; files are 0600" {
+/// The expiry of `key.<pub>.<sig>.<expiry>.<nonce>`.
+fn tokenExpiry(token: []const u8) !i64 {
+    var parts = std.mem.splitScalar(u8, token, '.');
+    for (0..3) |_| _ = parts.next();
+    return std.fmt.parseInt(i64, parts.next().?, 10);
+}
+
+fn tokenChallenge(token: []const u8) []const u8 {
+    return token[std.mem.lastIndexOfScalar(u8, token, '.').? + 1 ..];
+}
+
+test "keychain: signForHub binds the hub key and challenge; files are 0600" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const auth_path = try tmpPath(&tmp, "auth");
@@ -309,17 +359,16 @@ test "keychain: signForHub binds the hub key; files are 0600" {
 
     var kc = try hub_service.Keychain.init(testing.allocator, auth_path);
     defer kc.deinit();
-    const token = try kc.signForHub("HUBKEY", hub_service.AUTH_EXPIRY);
+    const token = try kc.signForHub("HUBKEY", "NONCE", hub_service.AUTH_EXPIRY);
     defer testing.allocator.free(token);
 
-    const expiry_text = token[std.mem.lastIndexOfScalar(u8, token, '.').? + 1 ..];
-    const expiry = try std.fmt.parseInt(i64, expiry_text, 10);
+    const expiry = try tokenExpiry(token);
     const now = std.time.timestamp();
-    try testing.expect(expiry >= now + 58 and expiry <= now + 60);
+    try testing.expect(expiry >= now + 28 and expiry <= now + 30);
 
     const key_file = try tmp.dir.readFileAlloc(testing.allocator, "auth", 1 << 10);
     defer testing.allocator.free(key_file);
-    const expected = try hub_service.authToken(testing.allocator, key_file, "HUBKEY", expiry);
+    const expected = try hub_service.authToken(testing.allocator, key_file, "HUBKEY", "NONCE", expiry);
     defer testing.allocator.free(expected);
     try testing.expectEqualStrings(expected, token);
 
@@ -344,8 +393,28 @@ const Connect = struct {
     }
 };
 
+const InfoMode = enum(u8) {
+    proving,
+    /// Proves its own key.
+    proving_other,
+    /// The real key, with no proof.
+    no_proof,
+    /// Claims the real key, signs with its own.
+    forged,
+    no_challenge,
+    /// Would add a header line.
+    bad_challenge,
+    /// Has no hub/info at all.
+    no_info,
+};
+
 var connects: [8]Connect = undefined;
 var connect_count = std.atomic.Value(usize).init(0);
+var credential_connects = std.atomic.Value(usize).init(0);
+var update_count = std.atomic.Value(usize).init(0);
+var info_count = std.atomic.Value(usize).init(0);
+var info_mode = std.atomic.Value(InfoMode).init(.proving);
+var nonces: [8][64]u8 = undefined;
 var hub_sender: ?channel.Sender(HubState) = null;
 
 fn copyHeader(headers: *const std.StringHashMapUnmanaged([]const u8), name: []const u8, out: []u8) usize {
@@ -357,6 +426,9 @@ fn copyHeader(headers: *const std.StringHashMapUnmanaged([]const u8), name: []co
 
 fn recordConnect(headers: *const std.StringHashMapUnmanaged([]const u8)) !HubState {
     const index = connect_count.load(.acquire);
+    if (headers.get("auth") != null or headers.get("device") != null or headers.get("v") != null) {
+        _ = credential_connects.fetchAdd(1, .acq_rel);
+    }
     if (index < connects.len) {
         var entry = &connects[index];
         entry.v_len = copyHeader(headers, "v", &entry.v);
@@ -375,21 +447,64 @@ fn replyNull(_: channel.PostRequest(HubState, Value, void)) !?Value {
     return null;
 }
 
-fn replyInfo(_: channel.PostRequest(HubState, void, void)) !?struct { key: []const u8, protocol: i64, pro: bool, mode: []const u8 } {
-    return .{ .key = HUB_KEY, .protocol = 1, .pro = true, .mode = "default-allow" };
+fn replyUpdate(_: channel.PostRequest(HubState, Value, void)) !?Value {
+    _ = update_count.fetchAdd(1, .acq_rel);
+    return null;
+}
+
+var info_proof: [128]u8 = undefined;
+var info_challenge: [32]u8 = undefined;
+
+fn replyInfo(request: channel.PostRequest(HubState, Value, void)) !?fake_hub.Info {
+    const nonce = request.body.object.get("nonce").?.string;
+    const count = info_count.fetchAdd(1, .acq_rel);
+    if (count < nonces.len) @memcpy(nonces[count][0..@min(nonce.len, 64)], nonce[0..@min(nonce.len, 64)]);
+    const challenge = try std.fmt.bufPrint(&info_challenge, "challenge-{d}", .{count + 1});
+    const allocator = std.heap.page_allocator;
+    return switch (info_mode.load(.acquire)) {
+        .proving, .no_info => .{
+            .key = HUB_KEY,
+            .proof = try fake_hub.proof(allocator, fake_hub.HUB_KEY_FILE, HUB_KEY, nonce, &info_proof),
+            .challenge = challenge,
+        },
+        .proving_other => .{
+            .key = fake_hub.OTHER_KEY,
+            .proof = try fake_hub.proof(allocator, fake_hub.OTHER_KEY_FILE, fake_hub.OTHER_KEY, nonce, &info_proof),
+            .challenge = challenge,
+        },
+        .no_proof => .{ .key = HUB_KEY, .challenge = challenge },
+        .forged => .{
+            .key = HUB_KEY,
+            .proof = try fake_hub.proof(allocator, fake_hub.OTHER_KEY_FILE, HUB_KEY, nonce, &info_proof),
+            .challenge = challenge,
+        },
+        .no_challenge => .{
+            .key = HUB_KEY,
+            .proof = try fake_hub.proof(allocator, fake_hub.HUB_KEY_FILE, HUB_KEY, nonce, &info_proof),
+        },
+        .bad_challenge => .{
+            .key = HUB_KEY,
+            .proof = try fake_hub.proof(allocator, fake_hub.HUB_KEY_FILE, HUB_KEY, nonce, &info_proof),
+            .challenge = "c\r\nx: y",
+        },
+    };
 }
 
 const FakeHub = struct {
     ch: channel.Channel(HubState),
     server: channel.Server(HubState),
 
-    fn start(self: *FakeHub, answers_info: bool) !void {
+    fn start(self: *FakeHub, mode: InfoMode) !void {
         connect_count.store(0, .release);
+        credential_connects.store(0, .release);
+        update_count.store(0, .release);
+        info_count.store(0, .release);
+        info_mode.store(mode, .release);
         hub_sender = null;
         self.ch = channel.Channel(HubState).init(testing.allocator);
-        _ = try self.ch.post("hub/service/update", replyNull);
+        _ = try self.ch.post("hub/service/update", replyUpdate);
         _ = try self.ch.post("hub/profile/update", replyNull);
-        if (answers_info) _ = try self.ch.post("hub/info", replyInfo);
+        if (mode != .no_info) _ = try self.ch.post("hub/info", replyInfo);
         self.server = try self.ch.listen(testing.allocator, 0, .{ .state = recordConnect, .on_connect = rememberSender });
     }
 
@@ -439,11 +554,11 @@ const Fixture = struct {
     }
 };
 
-test "fake hub: learns and pins the hub key, then connects with v1" {
+test "fake hub: a token goes out only after the proof, and the first key is pinned" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     var hub: FakeHub = undefined;
-    try hub.start(true);
+    try hub.start(.proving);
     defer hub.deinit();
 
     var svc = try fixture.service(&hub);
@@ -452,9 +567,15 @@ test "fake hub: learns and pins the hub key, then connects with v1" {
     hub.wait(2, 5000);
     svc.stop();
 
+    // The anonymous question, then the connect.
     try testing.expectEqual(@as(usize, 2), connect_count.load(.acquire));
-    try testing.expectEqualStrings("0", Connect.get(&connects[0].v, connects[0].v_len));
+    try testing.expectEqual(@as(usize, 1), credential_connects.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), connects[0].auth_len);
+    try testing.expectEqual(@as(usize, 0), connects[0].device_len);
+    try testing.expectEqual(@as(usize, 0), connects[0].v_len);
     try testing.expectEqualStrings("1", Connect.get(&connects[1].v, connects[1].v_len));
+    try testing.expectEqual(@as(usize, 1), info_count.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), update_count.load(.acquire));
 
     const address = try svc.pinAddress(testing.allocator);
     defer testing.allocator.free(address);
@@ -462,21 +583,90 @@ test "fake hub: learns and pins the hub key, then connects with v1" {
     defer testing.allocator.free(pinned);
     try testing.expectEqualStrings(HUB_KEY, pinned);
 
-    // The v1 token signs hub1:<hub key>:<expiry> with the service key.
+    // The token signs hub1:<hub key>:<challenge>:<expiry> with the service key.
     const token = Connect.get(&connects[1].auth, connects[1].auth_len);
-    const expiry = try std.fmt.parseInt(i64, token[std.mem.lastIndexOfScalar(u8, token, '.').? + 1 ..], 10);
+    try testing.expectEqualStrings("challenge-1", tokenChallenge(token));
     const key_file = try fixture.tmp.dir.readFileAlloc(testing.allocator, "auth", 1 << 10);
     defer testing.allocator.free(key_file);
-    const expected = try hub_service.authToken(testing.allocator, key_file, HUB_KEY, expiry);
+    const expected = try hub_service.authToken(testing.allocator, key_file, HUB_KEY, "challenge-1", try tokenExpiry(token));
     defer testing.allocator.free(expected);
     try testing.expectEqualStrings(expected, token);
 }
 
-test "fake hub: a pinned hub connects once with v1" {
+test "fake hub: every connect asks again, with a new nonce and challenge" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     var hub: FakeHub = undefined;
-    try hub.start(true);
+    try hub.start(.proving);
+    defer hub.deinit();
+
+    {
+        var svc = try fixture.service(&hub);
+        defer svc.deinit();
+        _ = try svc.start();
+        hub.wait(2, 5000);
+    }
+    {
+        // The same pin, a new connect.
+        var svc = try fixture.service(&hub);
+        defer svc.deinit();
+        _ = try svc.start();
+        hub.wait(4, 5000);
+    }
+    try testing.expectEqual(@as(usize, 4), connect_count.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), info_count.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), credential_connects.load(.acquire));
+    try testing.expect(!std.mem.eql(u8, &nonces[0], &nonces[1]));
+    try testing.expectEqualStrings("challenge-1", tokenChallenge(Connect.get(&connects[1].auth, connects[1].auth_len)));
+    try testing.expectEqualStrings("challenge-2", tokenChallenge(Connect.get(&connects[3].auth, connects[3].auth_len)));
+}
+
+fn checkGetsNothing(mode: InfoMode) !void {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var hub: FakeHub = undefined;
+    try hub.start(mode);
+    defer hub.deinit();
+
+    var svc = try fixture.service(&hub);
+    defer svc.deinit();
+    _ = try svc.start();
+    // Long enough for a retry: the first one comes after a second.
+    hub.wait(2, 1500);
+    svc.stop();
+
+    try testing.expect(connect_count.load(.acquire) >= 2);
+    try testing.expectEqual(@as(usize, 0), credential_connects.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), update_count.load(.acquire));
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access("hubs.json", .{}));
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access("auth", .{}));
+}
+
+test "fake hub: no proof gets nothing" {
+    try checkGetsNothing(.no_proof);
+}
+
+test "fake hub: the real key signed with another gets nothing" {
+    try checkGetsNothing(.forged);
+}
+
+test "fake hub: no challenge gets nothing" {
+    try checkGetsNothing(.no_challenge);
+}
+
+test "fake hub: a challenge that would add a header gets nothing" {
+    try checkGetsNothing(.bad_challenge);
+}
+
+test "fake hub: no hub/info gets nothing" {
+    try checkGetsNothing(.no_info);
+}
+
+test "fake hub: a pinned address answering with another proven key gets nothing" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var hub: FakeHub = undefined;
+    try hub.start(.proving_other);
     defer hub.deinit();
 
     var svc = try fixture.service(&hub);
@@ -485,36 +675,85 @@ test "fake hub: a pinned hub connects once with v1" {
     defer testing.allocator.free(address);
     try svc.keychain.pinHubKey(address, HUB_KEY);
     _ = try svc.start();
-    hub.wait(2, 500);
+    hub.wait(2, 1500);
     svc.stop();
 
-    try testing.expectEqual(@as(usize, 1), connect_count.load(.acquire));
-    try testing.expectEqualStrings("1", Connect.get(&connects[0].v, connects[0].v_len));
+    try testing.expectEqual(@as(usize, 0), credential_connects.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), update_count.load(.acquire));
+    const pinned = (try svc.keychain.hubKey(address)).?;
+    defer testing.allocator.free(pinned);
+    try testing.expectEqualStrings(HUB_KEY, pinned);
 }
 
-test "fake hub: hub-lite stays on v0" {
+fn stopSoon(svc: *Service) void {
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+    svc.stop();
+}
+
+test "fake hub: stop ends the wait of a call and of the retries" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     var hub: FakeHub = undefined;
-    try hub.start(false);
+    try hub.start(.no_proof);
     defer hub.deinit();
 
     var svc = try fixture.service(&hub);
     defer svc.deinit();
     _ = try svc.start();
-    hub.wait(2, 500);
-    svc.stop();
-
-    try testing.expectEqual(@as(usize, 1), connect_count.load(.acquire));
-    try testing.expectEqualStrings("0", Connect.get(&connects[0].v, connects[0].v_len));
-    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access("hubs.json", .{}));
+    const started = std.time.milliTimestamp();
+    const stopper = try std.Thread.spawn(.{}, stopSoon, .{&svc});
+    defer stopper.join();
+    try testing.expectError(error.ServiceNotStarted, svc.send(testing.allocator, "x", null));
+    try testing.expect(std.time.milliTimestamp() - started < 5000);
 }
 
-test "fake hub: every connect carries the device certificate" {
+fn proveSoon() void {
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+    info_mode.store(.proving, .release);
+}
+
+test "fake hub: a call waits until the hub proves its key" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     var hub: FakeHub = undefined;
-    try hub.start(true);
+    try hub.start(.no_proof);
+    defer hub.deinit();
+
+    var svc = try fixture.service(&hub);
+    defer svc.deinit();
+    _ = try svc.start();
+    const prover = try std.Thread.spawn(.{}, proveSoon, .{});
+    defer prover.join();
+    var reply = try svc.send(testing.allocator, "hub/profile/update", null);
+    defer reply.deinit(testing.allocator);
+    try testing.expect(reply == .ok);
+    try testing.expectEqual(@as(usize, 1), credential_connects.load(.acquire));
+    svc.stop();
+}
+
+test "a public ws:// address isn't dialed" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var svc = try Service.init(testing.allocator, .{
+        .address = .{ .url = "ws://hub.example.com:1997" },
+        .key_path = fixture.auth_path,
+        .device_key_path = fixture.device_path,
+    });
+    defer svc.deinit();
+    _ = try svc.start();
+    try testing.expect(svc.poll_thread == null);
+    try testing.expect(std.mem.indexOf(u8, svc.plaintextRefusal().?, "unencrypted") != null);
+    try testing.expectError(error.WouldCarryKeyUnencrypted, svc.send(testing.allocator, "x", null));
+    try testing.expectError(error.WouldCarryKeyUnencrypted, svc.values(testing.allocator, "x", null));
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access("auth", .{}));
+}
+
+test "the connect headers carry the token, v 1 and the certificate" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var hub: FakeHub = undefined;
+    try hub.start(.proving);
     defer hub.deinit();
 
     var svc = try fixture.service(&hub);
@@ -524,10 +763,7 @@ test "fake hub: every connect carries the device certificate" {
     svc.stop();
 
     try testing.expectEqual(@as(usize, 2), connect_count.load(.acquire));
-    const first = Connect.get(&connects[0].device, connects[0].device_len);
-    // Same certificate on the reconnect (renewed only with a day left).
-    try testing.expectEqualStrings(first, Connect.get(&connects[1].device, connects[1].device_len));
-    var parsed = try certificatePayload(first);
+    var parsed = try certificatePayload(Connect.get(&connects[1].device, connects[1].device_len));
     defer parsed.deinit();
     const service_key = try svc.keychain.publicKey();
     defer testing.allocator.free(service_key);
@@ -538,7 +774,7 @@ test "fake hub: disabled device mode sends no certificate" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     var hub: FakeHub = undefined;
-    try hub.start(false);
+    try hub.start(.proving);
     defer hub.deinit();
 
     var svc = try Service.init(testing.allocator, .{
@@ -548,11 +784,12 @@ test "fake hub: disabled device mode sends no certificate" {
     });
     defer svc.deinit();
     _ = try svc.start();
-    hub.wait(1, 5000);
+    hub.wait(2, 5000);
     svc.stop();
 
-    try testing.expectEqual(@as(usize, 1), connect_count.load(.acquire));
-    try testing.expectEqual(@as(usize, 0), connects[0].device_len);
+    try testing.expectEqual(@as(usize, 2), connect_count.load(.acquire));
+    try testing.expect(connects[1].auth_len > 0);
+    try testing.expectEqual(@as(usize, 0), connects[1].device_len);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access("device.key", .{}));
 }
 
@@ -570,7 +807,7 @@ test "fake hub: handlers see the caller" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     var hub: FakeHub = undefined;
-    try hub.start(false);
+    try hub.start(.proving);
     defer hub.deinit();
 
     var svc = try fixture.service(&hub);
@@ -578,7 +815,7 @@ test "fake hub: handlers see the caller" {
     _ = try svc.post("who", whoHandler, null);
     _ = try svc.stream("who/stream", whoStream, null);
     _ = try svc.start();
-    hub.wait(1, 5000);
+    hub.wait(2, 5000);
 
     var sender = hub_sender.?;
     const Context = struct { hub: struct {

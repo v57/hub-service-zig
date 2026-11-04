@@ -211,14 +211,14 @@ fn decodeBase64(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     return out;
 }
 
-test "keychain: token shape (key.<pub>.<sig>.<decimal expiry>) and signature verifies" {
+test "keychain: token shape (key.<pub>.<sig>.<decimal expiry>.<nonce>) and signature verifies" {
     const auth_path = try tmpAuthPath(testing.allocator);
     defer testing.allocator.free(auth_path);
 
     var kc = try hub_service.Keychain.init(testing.allocator, auth_path);
     defer kc.deinit();
 
-    const token = try kc.sign(30);
+    const token = try kc.signForHub("HUBKEY", "NONCE", 30);
     defer testing.allocator.free(token);
 
     var parts = std.mem.splitScalar(u8, token, '.');
@@ -226,6 +226,7 @@ test "keychain: token shape (key.<pub>.<sig>.<decimal expiry>) and signature ver
     const pub_b64 = parts.next().?;
     const sig_b64 = parts.next().?;
     const expiry = parts.next().?;
+    try testing.expectEqualStrings("NONCE", parts.next().?);
     try testing.expect(parts.next() == null);
 
     // pub part is the base64 of the 44-byte SPKI DER (== publicKey()).
@@ -239,8 +240,8 @@ test "keychain: token shape (key.<pub>.<sig>.<decimal expiry>) and signature ver
     const expiry_i = try std.fmt.parseInt(i64, expiry, 10);
     try testing.expect(expiry_i >= std.time.timestamp());
 
-    // Signature is 64 bytes over the expiry string and verifies against the
-    // raw public key (last 32 bytes of the SPKI DER).
+    // Signature is 64 bytes over hub1:<hub key>:<nonce>:<expiry> and verifies
+    // against the raw public key (last 32 bytes of the SPKI DER).
     const spki = try decodeBase64(testing.allocator, pub_b64);
     defer testing.allocator.free(spki);
     try testing.expectEqual(@as(usize, hub_service.PUBLIC_DER_LENGTH), spki.len);
@@ -251,7 +252,9 @@ test "keychain: token shape (key.<pub>.<sig>.<decimal expiry>) and signature ver
     try testing.expectEqual(@as(usize, 64), sig.len);
     const signature = std.crypto.sign.Ed25519.Signature.fromBytes(sig[0..64].*);
     const public_key = try std.crypto.sign.Ed25519.PublicKey.fromBytes(raw_pub);
-    try std.crypto.sign.Ed25519.Signature.verify(signature, expiry, public_key);
+    const data = try std.fmt.allocPrint(testing.allocator, "hub1:HUBKEY:NONCE:{s}", .{expiry});
+    defer testing.allocator.free(data);
+    try std.crypto.sign.Ed25519.Signature.verify(signature, data, public_key);
 }
 
 test "keychain: auth file round-trip (generate, reload, same key)" {
@@ -286,7 +289,7 @@ test "keychain: loads a TS-generated auth file and reproduces its public key" {
     defer testing.allocator.free(pub_key_ts);
     try testing.expectEqualStrings(TS_PUB, pub_key_ts);
 
-    const token = try kc.sign(10);
+    const token = try kc.signForHub("HUBKEY", "NONCE", 10);
     defer testing.allocator.free(token);
     var parts = std.mem.splitScalar(u8, token, '.');
     _ = parts.next().?; // "key"
@@ -302,5 +305,7 @@ test "keychain: loads a TS-generated auth file and reproduces its public key" {
     defer testing.allocator.free(sig);
     const signature = std.crypto.sign.Ed25519.Signature.fromBytes(sig[0..64].*);
     const public_key = try std.crypto.sign.Ed25519.PublicKey.fromBytes(raw_pub);
-    try std.crypto.sign.Ed25519.Signature.verify(signature, expiry, public_key);
+    const data = try std.fmt.allocPrint(testing.allocator, "hub1:HUBKEY:NONCE:{s}", .{expiry});
+    defer testing.allocator.free(data);
+    try std.crypto.sign.Ed25519.Signature.verify(signature, data, public_key);
 }
